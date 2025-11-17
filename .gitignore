@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.env
+.env.local
+
+# Database
+enron_emails.db
+*.db
+*.sqlite
+
+# Training outputs
+outputs/
+wandb/
+runs/
+checkpoints/
+
+# Logs
+*.log
+logs/
+
+# Model files
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Training outputs - keep structure but ignore contents
+outputs/**/*
+!outputs/.gitkeep
+
+# Benchmark results
+benchmark_results_*.csv
+
+# Data - keep structure but ignore database
+/data
+enron_emails.db
+
+# Cache (local only)
+litellm_cache/
+.litellm_cache/
+
+# Git
+.git/
+
+# OS
+.DS_Store
+Thumbs.db
+

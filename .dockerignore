@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+
+# Git
+.git/
+
+# Environment
+.env
+
+# Database (will be generated)
+enron_emails.db
+data/*.db
+
+# Training outputs (will be generated)
+outputs/**/*
+
+# Benchmark results
+benchmark_results_*.csv
+
+# Cache (will be mounted)
+.cache/
+cache/
+litellm_cache/
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs (not needed in image)
+*.md
+!README.md
+
+# Test files
+test_*.py

@@ -1,0 +1,30 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.40.0
+datasets>=2.14.0
+pydantic>=2.0.0
+
+# Unsloth for fast training
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+
+# TRL for GRPO
+trl>=0.8.0
+
+# OpenAI for judge model
+openai>=1.0.0
+
+# Database and data processing
+tqdm>=4.65.0
+polars>=0.19.0
+
+# Training utilities
+accelerate>=0.20.0
+bitsandbytes>=0.41.0
+
+# Logging and monitoring
+wandb>=0.15.0
+
+# Development tools
+ipython>=8.12.0
+jupyter>=1.0.0
+
