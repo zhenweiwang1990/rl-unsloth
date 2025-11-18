@@ -116,6 +116,12 @@ Queries are loaded from the [corbt/enron_emails_sample_questions](https://huggin
 - Ground truth answer
 - Message IDs of relevant emails
 
+**Dataset Splits** (to prevent overfitting):
+- **Train split** (4,390 examples): Used for training
+- **Test split** (1,733 examples): Used for validation during training, evaluation, and benchmarking
+
+See [DATASET_SPLIT_USAGE.md](DATASET_SPLIT_USAGE.md) for detailed information.
+
 ### 2. Agent Loop
 
 For each query, the agent:
@@ -164,11 +170,35 @@ This makes rewards more comparable across different queries.
 
 ## Evaluation
 
+### Running Evaluation
+
+Evaluate a trained model on the **test split**:
+
+```bash
+python eval.py --model-path outputs/grpo/final --num-queries 100
+```
+
+Or run a comprehensive benchmark:
+
+```bash
+python benchmark.py --model-path outputs/grpo/final --limit 100
+```
+
+To test the dataset splits:
+
+```bash
+python test_dataset_splits.py
+```
+
+### Evaluation Metrics
+
 The model is evaluated using GPT-4o as a judge to determine if answers are semantically correct. Metrics tracked:
 - Answer correctness
 - Source correctness
 - Number of turns
 - Various error types (bad tool calls, invalid emails, etc.)
+
+**Important**: All evaluation and benchmarking use the **test split** to ensure unbiased results and prevent overfitting.
 
 ## Advanced Usage
 

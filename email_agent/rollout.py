@@ -97,7 +97,7 @@ async def determine_if_answer_is_correct(
     openai_client: AsyncOpenAI,
     verbose: bool = False
 ) -> bool:
-    """Use Qwen3-32B (via OpenRouter) to determine if the answer is correct.
+    """Use Gemini 2.5 Flash (via OpenRouter) to determine if the answer is correct.
     
     Args:
         answer: The answer provided by the agent
@@ -130,7 +130,7 @@ async def determine_if_answer_is_correct(
 
     if verbose:
         print("\n" + "="*60)
-        print("JUDGE EVALUATION (Qwen3-32B via OpenRouter)")
+        print("JUDGE EVALUATION (DeepSeek V3.2 via OpenRouter)")
         print("="*60)
         print(f"Question: {query.question}")
         print(f"\nGround Truth: {query.answer}")
@@ -138,17 +138,38 @@ async def determine_if_answer_is_correct(
         print("\nCalling judge model...")
 
     response = await openai_client.chat.completions.create(
-        model="qwen/qwen3-32b",
+        model="deepseek/deepseek-v3.2-exp",
         messages=messages,
-        temperature=0,
         max_tokens=10,  # Allow a bit more tokens for True/False response
+        extra_body={
+            "thinking": False,  # Explicitly disable thinking/reasoning
+        }
     )
 
-    judge_result = response.choices[0].message.content.strip().lower().startswith("t")
+    # Extract the final message content (not thinking/reasoning)
+    message = response.choices[0].message
+    content = message.content
+    
+    # For models with thinking, content should only contain the final response
+    # Extract True/False from the actual response content
+    if content:
+        content_clean = content.strip().lower()
+        # Look for "true" or "false" in the response, case-insensitive
+        if "true" in content_clean:
+            judge_result = True
+        elif "false" in content_clean:
+            judge_result = False
+        else:
+            # Fallback: check if starts with 't'
+            judge_result = content_clean.startswith("t")
+            logger.warning(f"Judge returned unexpected response: {content}")
+    else:
+        judge_result = False
+        logger.error("Judge returned empty content")
     
     if verbose:
         print(f"\nJudge Decision: {'✓ CORRECT' if judge_result else '✗ INCORRECT'}")
-        print(f"Judge Response: {response.choices[0].message.content.strip()}")
+        print(f"Judge Response: {content.strip() if content else 'Empty'}")
         print("="*60)
     
     logger.info(

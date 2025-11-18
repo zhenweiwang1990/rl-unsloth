@@ -2,14 +2,13 @@
 
 import json
 import logging
-import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import asdict
 
 from email_agent.data.types import SyntheticQuery
 from email_agent.tools import search_emails, read_email, SearchResult
 from email_agent.config import PolicyConfig
-from email_agent.prompts import create_system_prompt
+from email_agent.prompts import create_system_prompt, get_tools_schema
 from email_agent.rollout import (
     EvaluationRubric,
     determine_if_answer_is_correct,
@@ -25,8 +24,8 @@ class EmailAgent:
     
     This agent:
     1. Takes a model and tokenizer
-    2. Generates responses using transformers
-    3. Parses JSON-formatted tool calls
+    2. Uses transformers' native tool calling support with OpenAI-format tools
+    3. Parses OpenAI-formatted tool calls from model output
     4. Executes tools and updates conversation
     5. Tracks evaluation metrics
     """
@@ -50,6 +49,7 @@ class EmailAgent:
         self.tokenizer = tokenizer
         self.policy_config = policy_config
         self.openai_client = openai_client
+        self.tools = get_tools_schema()
         
     async def run_query(
         self,
@@ -94,39 +94,21 @@ class EmailAgent:
                 print(f"{'─'*80}")
             
             try:
-                # Generate model response
-                response = self._generate_response(conversation, verbose)
+                # Generate model response using LiteLLM
+                response_message, raw_content = self._generate_response(conversation, verbose)
                 
                 # Add assistant message to conversation
-                conversation.append({"role": "assistant", "content": response})
+                conversation.append({
+                    "role": "assistant",
+                    "content": response_message.get("content"),
+                    "tool_calls": response_message.get("tool_calls"),
+                })
                 
-                # Parse tool calls or final answer from response
-                parsed_data = self._parse_response(response, verbose)
-                
-                if parsed_data is None:
-                    # Could not parse response
-                    rubric.cant_parse_tool_call = True
-                    if verbose:
-                        print(f"\n⚠️  Could not parse JSON from model response")
-                    break
-                
-                # Check if this is a final answer
-                if "final_answer" in parsed_data:
-                    # Handle final answer
-                    should_break = await self._handle_final_answer(
-                        parsed_data,
-                        query,
-                        rubric,
-                        verbose,
-                    )
-                    if should_break:
-                        break
-                        
-                # Check if there are tool calls
-                elif "tool_calls" in parsed_data:
-                    # Execute tool calls
+                # Check if there are tool calls from LiteLLM
+                if response_message.get("tool_calls"):
+                    # Execute tool calls (OpenAI format from LiteLLM)
                     should_break = await self._execute_tool_calls(
-                        parsed_data["tool_calls"],
+                        response_message["tool_calls"],
                         query,
                         rubric,
                         conversation,
@@ -135,11 +117,20 @@ class EmailAgent:
                     if should_break:
                         break
                         
-                else:
-                    # Invalid format
+                # Check if this is text response (no tool calls)
+                elif response_message.get("content"):
+                    # Model returned text instead of tool call
+                    # This shouldn't happen with proper tool calling
                     rubric.cant_parse_tool_call = True
                     if verbose:
-                        print(f"\n⚠️  Response JSON missing both 'tool_calls' and 'final_answer'")
+                        print(f"\n⚠️  Model returned text instead of tool call: {response_message['content'][:100]}")
+                    break
+                        
+                else:
+                    # Empty response
+                    rubric.cant_parse_tool_call = True
+                    if verbose:
+                        print(f"\n⚠️  Model returned empty response")
                     break
                     
             except Exception as e:
@@ -162,22 +153,43 @@ class EmailAgent:
         
         return rubric, conversation
     
-    def _generate_response(self, conversation: List[Dict], verbose: bool) -> str:
-        """Generate a response from the model.
+    def _generate_response(
+        self, 
+        conversation: List[Dict], 
+        verbose: bool
+    ) -> Tuple[Dict[str, Any], str]:
+        """Generate a response from the model with OpenAI-format tool calling.
+        
+        Uses transformers' native chat template with tools support.
         
         Args:
             conversation: Conversation history
             verbose: Whether to print logs
             
         Returns:
-            Generated response text
+            Tuple of (response_message_dict, raw_content)
+            - response_message_dict: Contains 'content' and/or 'tool_calls'
+            - raw_content: Raw generated text for debugging
         """
-        # Format conversation for model
-        text = self.tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        # Check if tokenizer supports tool calling via chat template
+        try:
+            # Format conversation with tools using chat template
+            # Many modern tokenizers (Llama 3, Qwen, etc.) support tools parameter
+            text = self.tokenizer.apply_chat_template(
+                conversation,
+                tools=self.tools,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except (TypeError, ValueError) as e:
+            # Fallback: tokenizer doesn't support tools parameter
+            logger.warning(f"Tokenizer doesn't support tools parameter: {e}")
+            # Use regular chat template without tools
+            text = self.tokenizer.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         
         # Generate
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
@@ -195,54 +207,128 @@ class EmailAgent:
             skip_special_tokens=True,
         )
         
+        # Parse tool calls from response if present
+        response_message, parsed_successfully = self._parse_tool_calls_from_response(response, verbose)
+        
         if verbose:
             print(f"\n📝 Model Response:")
-            if len(response) > 500:
-                print(f"   {response[:500]}...")
-            else:
-                print(f"   {response}")
+            if response_message.get("tool_calls"):
+                print(f"   Tool Calls: {len(response_message['tool_calls'])}")
+                for tc in response_message["tool_calls"]:
+                    func_name = tc['function']['name']
+                    func_args = tc['function']['arguments'][:100]
+                    print(f"   - {func_name}: {func_args}")
+            elif response_message.get("content"):
+                content = response_message["content"]
+                if len(content) > 500:
+                    print(f"   {content[:500]}...")
+                else:
+                    print(f"   {content}")
         
-        return response
+        return response_message, response
     
-    def _parse_response(self, response: str, verbose: bool) -> Optional[Dict[str, Any]]:
-        """Parse JSON from model response.
+    def _parse_tool_calls_from_response(
+        self,
+        response: str,
+        verbose: bool
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Parse tool calls from model response.
+        
+        Supports multiple formats:
+        1. OpenAI-style function calling XML/JSON tags
+        2. Direct JSON tool call objects
+        3. Plain text (no tool calls)
         
         Args:
-            response: Model response text
+            response: Raw model response
             verbose: Whether to print logs
             
         Returns:
-            Parsed JSON dictionary, or None if parsing failed
+            Tuple of (response_message_dict, success)
+            - response_message_dict: Contains 'content' and/or 'tool_calls'
+            - success: True if parsing was successful
         """
+        import re
+        
+        # Try to parse structured tool calls
+        # Look for <tool_call> tags (some models use this)
+        tool_call_pattern = r'<tool_call>(.*?)</tool_call>'
+        tool_call_matches = re.findall(tool_call_pattern, response, re.DOTALL)
+        
+        if tool_call_matches:
+            # Parse tool calls from XML-like format
+            tool_calls = []
+            for i, match in enumerate(tool_call_matches):
+                try:
+                    # Parse JSON inside tool_call tags
+                    tool_data = json.loads(match.strip())
+                    tool_calls.append({
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_data.get("name", ""),
+                            "arguments": json.dumps(tool_data.get("arguments", {})),
+                        }
+                    })
+                except json.JSONDecodeError:
+                    if verbose:
+                        print(f"\n⚠️  Failed to parse tool call: {match[:100]}")
+                    continue
+            
+            if tool_calls:
+                return {
+                    "content": None,
+                    "tool_calls": tool_calls,
+                }, True
+        
+        # Try to find JSON object that looks like a tool call
+        # Look for patterns like {"name": "...", "arguments": {...}}
         try:
             # Try to extract JSON from response
-            # Look for JSON object (content between { and })
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            json_match = re.search(r'\{[^{}]*"name"[^{}]*"arguments"[^{}]*\}', response, re.DOTALL)
+            if not json_match:
+                # Try more complex nested JSON
+                json_match = re.search(r'\{(?:[^{}]|{[^{}]*})*\}', response, re.DOTALL)
+            
             if json_match:
                 json_str = json_match.group()
                 parsed = json.loads(json_str)
-                return parsed
-            else:
-                if verbose:
-                    print(f"\n⚠️  No JSON object found in response")
-                return None
                 
-        except json.JSONDecodeError as e:
-            if verbose:
-                print(f"\n⚠️  JSON parse error: {e}")
-            return None
+                # Check if it's a tool call format
+                if "name" in parsed and "arguments" in parsed:
+                    tool_calls = [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {
+                            "name": parsed["name"],
+                            "arguments": json.dumps(parsed["arguments"]),
+                        }
+                    }]
+                    return {
+                        "content": None,
+                        "tool_calls": tool_calls,
+                    }, True
+                    
+        except (json.JSONDecodeError, KeyError):
+            pass
+        
+        # No tool calls found, return as plain text
+        return {
+            "content": response,
+            "tool_calls": None,
+        }, True
     
-    async def _handle_final_answer(
+    async def _handle_return_final_answer(
         self,
-        parsed_data: Dict[str, Any],
+        tool_args: Dict[str, Any],
         query: SyntheticQuery,
         rubric: EvaluationRubric,
         verbose: bool,
     ) -> bool:
-        """Handle final answer from the model.
+        """Handle return_final_answer tool call.
         
         Args:
-            parsed_data: Parsed JSON data with final_answer
+            tool_args: Tool arguments with 'answer' and 'source_message_ids'
             query: The query being processed
             rubric: Evaluation rubric to update
             verbose: Whether to print logs
@@ -250,8 +336,8 @@ class EmailAgent:
         Returns:
             True (should break the agent loop)
         """
-        final_answer = parsed_data.get("final_answer")
-        source_message_ids = parsed_data.get("source_message_ids", [])
+        final_answer = tool_args.get("answer", "")
+        source_message_ids = tool_args.get("source_message_ids", [])
         
         if verbose:
             print(f"\n🎯 Agent returning final answer...")
@@ -277,7 +363,7 @@ class EmailAgent:
             # Call judge to check answer (if OpenAI client available)
             if self.openai_client:
                 if verbose:
-                    print(f"\n   Calling GPT-4o judge to evaluate answer...")
+                    print(f"\n   Calling judge model to evaluate answer...")
                 
                 rubric.answer_correct = await self._judge_answer(
                     final_answer,
@@ -306,7 +392,7 @@ class EmailAgent:
         """Execute tool calls and update conversation.
         
         Args:
-            tool_calls: List of tool call dictionaries
+            tool_calls: List of OpenAI-format tool call dictionaries
             query: The query being processed
             rubric: Evaluation rubric to update
             conversation: Conversation history to update
@@ -318,8 +404,22 @@ class EmailAgent:
         should_break = False
         
         for tool_call in tool_calls:
-            tool_name = tool_call.get("tool_name")
-            tool_args = tool_call.get("arguments", {})
+            # Extract tool call info from OpenAI format
+            tool_call_id = tool_call.get("id", "")
+            tool_function = tool_call.get("function", {})
+            tool_name = tool_function.get("name")
+            
+            # Parse arguments (they come as JSON string in OpenAI format)
+            arguments_str = tool_function.get("arguments", "{}")
+            try:
+                tool_args = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+            except json.JSONDecodeError as e:
+                rubric.bad_tool_call_args = True
+                if verbose:
+                    print(f"\n❌ Failed to parse tool arguments: {e}")
+                    print(f"   Arguments string: {arguments_str}")
+                should_break = True
+                break
             
             if not tool_name:
                 rubric.bad_tool_call_name = True
@@ -330,6 +430,7 @@ class EmailAgent:
             
             if verbose:
                 print(f"\n🔧 Tool Call: {tool_name}")
+                print(f"   ID: {tool_call_id}")
                 print(f"   Arguments: {json.dumps(tool_args, indent=4)}")
             
             # Execute the tool
@@ -355,9 +456,10 @@ class EmailAgent:
                     else:
                         print(f"   ✓ {json.dumps(tool_result, indent=4)[:200]}...")
             
-            # Add tool result to conversation
+            # Add tool result to conversation in OpenAI format
             conversation.append({
                 "role": "tool",
+                "tool_call_id": tool_call_id,
                 "content": json.dumps(tool_result),
             })
             
@@ -464,11 +566,14 @@ class EmailAgent:
                 return email_content.model_dump(), should_break
                 
         elif tool_name == "return_final_answer":
-            # This should not happen here (handled separately)
-            # But handle it gracefully
-            rubric.bad_tool_call_name = True
-            logger.warning("return_final_answer called as tool_call instead of final_answer format")
-            return {"error": "Use final_answer format instead"}, True
+            # Handle final answer tool call
+            should_break = await self._handle_return_final_answer(
+                tool_args,
+                query,
+                rubric,
+                verbose,
+            )
+            return {"status": "Final answer submitted"}, should_break
             
         else:
             rubric.bad_tool_call_name = True

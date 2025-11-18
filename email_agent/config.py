@@ -9,7 +9,7 @@ class GRPOConfig(BaseModel):
     
     # Model settings
     model_name: str = "unsloth/Qwen3-14B-Base"
-    max_seq_length: int = 2048
+    max_seq_length: int = 8192
     load_in_4bit: bool = True
     
     # LoRA settings
@@ -35,7 +35,7 @@ class GRPOConfig(BaseModel):
     
     # Agent settings
     max_turns: int = 10
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     
     # Dataset settings
     train_dataset_size: int = 1000
@@ -54,7 +54,7 @@ class PolicyConfig(BaseModel):
     """Policy configuration for the email agent."""
     
     max_turns: int = 10
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     use_tools: bool = True
     stupid_simple_reward_fn: bool = False
     verbose: bool = False

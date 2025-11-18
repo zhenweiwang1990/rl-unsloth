@@ -56,13 +56,13 @@ async def benchmark_model(
     # Initialize policy config
     policy_config = PolicyConfig(
         max_turns=get_env_int("MAX_TURNS", "10"),
-        max_tokens=get_env_int("MAX_TOKENS", "2048"),
+        max_tokens=get_env_int("MAX_TOKENS", "4096"),
         verbose=verbose,
     )
     
     # Get base model name from environment
     base_model_name = os.environ.get("MODEL_NAME", "unsloth/Qwen3-14B-Base")
-    max_seq_length = get_env_int("MAX_SEQ_LENGTH", "2048")
+    max_seq_length = get_env_int("MAX_SEQ_LENGTH", "8192")
             
     # Load model with unsloth optimization
     if model_path:
@@ -102,15 +102,15 @@ async def benchmark_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load queries
-    logger.info(f"Loading {limit} benchmark queries...")
+    # Load queries from test split to avoid overfitting
+    logger.info(f"Loading {limit} benchmark queries from test split...")
     queries = load_synthetic_queries(
-        split="train",
+        split="test",
         limit=limit,
         shuffle=True,
         max_messages=1,
     )
-    logger.info(f"✓ Loaded {len(queries)} queries")
+    logger.info(f"✓ Loaded {len(queries)} queries from test split")
     
     # Initialize OpenRouter client (for judge only)
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -145,14 +145,9 @@ async def benchmark_model(
     
     start_time = datetime.now()
     
-    # Use tqdm only if not verbose (otherwise it interferes with detailed output)
-    query_iterator = enumerate(queries) if verbose else enumerate(tqdm(queries, desc="Benchmarking"))
-    
-    for idx, query in query_iterator:
+    # Don't use tqdm since we'll print progress for each query
+    for idx, query in enumerate(queries):
         query_start = datetime.now()
-        
-        if not verbose and (idx + 1) % 10 == 0:
-            logger.info(f"Progress: {idx+1}/{len(queries)} queries completed")
         
         # Run agent
         rubric, conversation = await agent.run_query(
@@ -186,6 +181,16 @@ async def benchmark_model(
             "duration_seconds": query_duration,
         }
         results.append(result)
+        
+        # Print progress after each query
+        logger.info(
+            f"[{idx+1}/{len(queries)}] "
+            f"Reward: {reward:.3f} | "
+            f"Correct: {rubric.answer_correct} | "
+            f"Turns: {rubric.num_turns} | "
+            f"Time: {query_duration:.1f}s | "
+            f"Question: {query.question[:60]}..."
+        )
     
     # Convert to DataFrame
     df = pl.DataFrame(results)
@@ -262,15 +267,45 @@ async def main():
         verbose=verbose,
     )
     
-    # Save results
+    # Save results to outputs directory (mounted from host)
     if args.output:
         output_path = args.output
     else:
         run_id = os.environ.get("RUN_ID", "001")
-        output_path = f"benchmark_results_{run_id}.csv"
+        # Create outputs directory if it doesn't exist
+        os.makedirs("outputs", exist_ok=True)
+        output_path = f"outputs/benchmark_results_{run_id}.csv"
     
     results.write_csv(output_path)
     logger.info(f"\n✓ Results saved to {output_path}")
+    
+    # Print final summary
+    logger.info("")
+    logger.info("="*60)
+    logger.info("FINAL BENCHMARK SUMMARY")
+    logger.info("="*60)
+    logger.info(f"Model: {args.model_path if args.model_path else 'Base model (no fine-tuning)'}")
+    logger.info(f"Total queries evaluated: {len(results)}")
+    logger.info(f"Results file: {output_path}")
+    logger.info("")
+    logger.info("Key Metrics:")
+    logger.info(f"  • Average Reward: {results['reward'].mean():.3f}")
+    logger.info(f"  • Answer Accuracy: {results['answer_correct'].mean():.1%}")
+    logger.info(f"  • Source Accuracy: {results['sources_correct'].mean():.1%}")
+    logger.info(f"  • Average Turns: {results['num_turns'].mean():.2f}")
+    logger.info("")
+    logger.info("Success Indicators:")
+    logger.info(f"  • Attempted Answer: {results['attempted_answer'].sum()}/{len(results)} ({results['attempted_answer'].mean():.1%})")
+    logger.info(f"  • Found Right Email: {results['ever_found_right_email'].sum()}/{len(results)} ({results['ever_found_right_email'].mean():.1%})")
+    logger.info(f"  • Read Right Email: {results['ever_read_right_email'].sum()}/{len(results)} ({results['ever_read_right_email'].mean():.1%})")
+    logger.info("")
+    logger.info("Error Analysis:")
+    logger.info(f"  • Ran Out of Turns: {results['ran_out_of_turns'].sum()} ({results['ran_out_of_turns'].mean():.1%})")
+    logger.info(f"  • Returned 'I Don't Know': {results['returned_i_dont_know'].sum()} ({results['returned_i_dont_know'].mean():.1%})")
+    logger.info(f"  • Parse Errors: {results['cant_parse_tool_call'].sum()} ({results['cant_parse_tool_call'].mean():.1%})")
+    logger.info(f"  • Bad Tool Name: {results['bad_tool_call_name'].sum()} ({results['bad_tool_call_name'].mean():.1%})")
+    logger.info(f"  • Bad Tool Args: {results['bad_tool_call_args'].sum()} ({results['bad_tool_call_args'].mean():.1%})")
+    logger.info("="*60)
 
 
 if __name__ == "__main__":

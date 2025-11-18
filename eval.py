@@ -36,7 +36,7 @@ async def evaluate_model(
     
     # Get base model name from environment
     base_model_name = os.environ.get("MODEL_NAME", "unsloth/Qwen3-14B-Base")
-    max_seq_length = int(os.environ.get("MAX_SEQ_LENGTH", "2048"))
+    max_seq_length = int(os.environ.get("MAX_SEQ_LENGTH", "8192"))
     
     # Load model with unsloth optimization
     logger.info(f"Base model: {base_model_name}")
@@ -62,20 +62,20 @@ async def evaluate_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load queries
-    logger.info(f"Loading {num_queries} evaluation queries...")
+    # Load queries from test split to avoid overfitting
+    logger.info(f"Loading {num_queries} evaluation queries from test split...")
     queries = load_synthetic_queries(
-        split="train",
+        split="test",
         limit=num_queries,
         shuffle=True,
         max_messages=1,
     )
-    logger.info(f"✓ Loaded {len(queries)} queries")
+    logger.info(f"✓ Loaded {len(queries)} queries from test split")
     
     # Initialize policy config
     policy_config = PolicyConfig(
         max_turns=10,
-        max_tokens=2048,
+        max_tokens=4096,
         verbose=verbose,
     )
     

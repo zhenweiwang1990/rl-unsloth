@@ -9,9 +9,11 @@ echo ""
 # Docker image name
 IMAGE_NAME="email-agent-grpo"
 
-# Check if .env file exists
-if [ ! -f "env.example" ]; then
-    echo "Warning: env.example not found. Using default configuration."
+# Load environment variables
+ENV_FILE=""
+if [ -f ".env" ]; then
+    ENV_FILE="--env-file .env"
+    echo "Loading environment from .env file"
 fi
 
 # Check if database exists
@@ -27,13 +29,6 @@ if ! docker image inspect $IMAGE_NAME &> /dev/null; then
     docker build -t $IMAGE_NAME .
 fi
 
-# Load environment variables from .env if it exists
-ENV_FILE=""
-if [ -f ".env" ]; then
-    ENV_FILE="--env-file .env"
-    echo "Loading environment from .env file"
-fi
-
 # Check for GPU
 if command -v nvidia-smi &> /dev/null; then
     echo "GPU Information:"
@@ -47,6 +42,8 @@ fi
 
 # Run training in Docker
 echo "Starting GRPO training in Docker..."
+echo "Cache directory: $HOME/.cache/huggingface"
+ls -lah "$HOME/.cache/huggingface" 2>/dev/null || echo "Cache directory not found"
 echo ""
 
 docker run --rm -it \
@@ -58,6 +55,8 @@ docker run --rm -it \
     -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+    -e TRANSFORMERS_CACHE=/root/.cache/huggingface \
+    -e HF_DATASETS_CACHE=/root/.cache/huggingface \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
     python train_grpo.py
