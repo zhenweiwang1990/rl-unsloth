@@ -155,8 +155,8 @@ async def execute_rollout(
             
             # Progress line
             progress_line = f"⏱️  Progress: Step {step}/{max_steps} ({step/max_steps*100:.1f}%) | "
-            progress_line += f"Rollout {current_rollout}/{total_rollouts} | "
-            progress_line += f"Query {query_idx+1}/{total_queries}"
+            progress_line += f"Query {query_idx+1}/{total_queries} | "
+            progress_line += f"Rollout {current_rollout}/{total_rollouts}"
             print(progress_line, flush=True)
             
             # Time estimates

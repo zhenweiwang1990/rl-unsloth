@@ -26,8 +26,8 @@ class GRPOConfig(BaseModel):
     max_steps: int = 1000
     warmup_steps: int = 10
     logging_steps: int = 1
-    eval_steps: int = 50
-    save_steps: int = 100
+    eval_steps: int = 2
+    save_steps: int = 2
     
     # GRPO-specific
     beta: float = 0.0  # KL divergence weight (0.0 = no KL penalty)

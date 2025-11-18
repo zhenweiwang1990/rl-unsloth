@@ -95,7 +95,11 @@ class EmailAgent:
             
             try:
                 # Generate model response using LiteLLM
-                response_message, raw_content = self._generate_response(conversation, verbose)
+                response_message, raw_content, input_tokens, output_tokens = self._generate_response(conversation, verbose)
+                
+                # Track token usage
+                rubric.total_input_tokens += input_tokens
+                rubric.total_output_tokens += output_tokens
                 
                 # Add assistant message to conversation
                 conversation.append({
@@ -157,7 +161,7 @@ class EmailAgent:
         self, 
         conversation: List[Dict], 
         verbose: bool
-    ) -> Tuple[Dict[str, Any], str]:
+    ) -> Tuple[Dict[str, Any], str, int, int]:
         """Generate a response from the model with OpenAI-format tool calling.
         
         Uses transformers' native chat template with tools support.
@@ -167,9 +171,11 @@ class EmailAgent:
             verbose: Whether to print logs
             
         Returns:
-            Tuple of (response_message_dict, raw_content)
+            Tuple of (response_message_dict, raw_content, input_tokens, output_tokens)
             - response_message_dict: Contains 'content' and/or 'tool_calls'
             - raw_content: Raw generated text for debugging
+            - input_tokens: Number of input tokens
+            - output_tokens: Number of output tokens
         """
         # Check if tokenizer supports tool calling via chat template
         try:
@@ -193,6 +199,8 @@ class EmailAgent:
         
         # Generate
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+        input_tokens = inputs.input_ids.shape[1]
+        
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=self.policy_config.max_tokens,
@@ -201,9 +209,11 @@ class EmailAgent:
             pad_token_id=self.tokenizer.pad_token_id,
         )
         
+        output_tokens = outputs.shape[1] - input_tokens
+        
         # Decode response
         response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],
+            outputs[0][input_tokens:],
             skip_special_tokens=True,
         )
         
@@ -225,7 +235,7 @@ class EmailAgent:
                 else:
                     print(f"   {content}")
         
-        return response_message, response
+        return response_message, response, input_tokens, output_tokens
     
     def _parse_tool_calls_from_response(
         self,

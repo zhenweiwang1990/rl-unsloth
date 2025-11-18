@@ -294,7 +294,7 @@ def main():
             max_grad_norm=1.0,
             output_dir=config.output_dir,
             target_accuracy=0.95,
-            eval_steps=2,  # Evaluate every 30 steps
+            eval_steps=2,  # Evaluate every 2 steps
             save_steps=4,
             max_steps=config.max_steps,
             warmup_steps=10,

@@ -45,8 +45,8 @@ class AgentGRPOTrainer:
         max_grad_norm: float = 1.0,
         output_dir: str = "outputs/grpo",
         target_accuracy: float = 0.95,
-        eval_steps: int = 50,
-        save_steps: int = 100,
+        eval_steps: int = 2,
+        save_steps: int = 2,
         max_steps: int = 1000,
         warmup_steps: int = 10,
         patience: int = 5,  # Early stopping: stop if no improvement for N evaluations
@@ -370,6 +370,8 @@ class AgentGRPOTrainer:
         trajectories = []
         rewards = []
         rubrics = []
+        total_input_tokens = 0
+        total_output_tokens = 0
         
         total_rollouts = len(queries) * self.num_rollouts
         batch_start_time = time.time()
@@ -415,6 +417,10 @@ class AgentGRPOTrainer:
                     rewards.append(reward)
                     rubrics.append(rubric)
                     
+                    # Accumulate token usage
+                    total_input_tokens += rubric.total_input_tokens
+                    total_output_tokens += rubric.total_output_tokens
+                    
                     # Update progress bar with current stats
                     if not log_rollouts:
                         pbar.set_postfix({
@@ -426,11 +432,16 @@ class AgentGRPOTrainer:
         
         if log_rollouts:
             total_time = time.time() - batch_start_time
+            avg_input_tokens = total_input_tokens / total_rollouts if total_rollouts > 0 else 0
+            avg_output_tokens = total_output_tokens / total_rollouts if total_rollouts > 0 else 0
+            
             print(f"\n{'='*80}", flush=True)
             print(f"✅ ROLLOUT COLLECTION COMPLETE", flush=True)
             print(f"Total time: {total_time:.1f}s | Avg per rollout: {total_time/total_rollouts:.1f}s", flush=True)
             print(f"Rewards: mean={np.mean(rewards):.2f}, std={np.std(rewards):.2f}, "
                   f"min={np.min(rewards):.2f}, max={np.max(rewards):.2f}", flush=True)
+            print(f"Tokens: input={total_input_tokens:,} (avg {avg_input_tokens:.0f}/rollout), "
+                  f"output={total_output_tokens:,} (avg {avg_output_tokens:.0f}/rollout)", flush=True)
             print(f"{'='*80}\n", flush=True)
         
         return trajectories, rewards, rubrics
@@ -652,7 +663,7 @@ class AgentGRPOTrainer:
         
         return metrics
     
-    async def evaluate(self) -> Tuple[float, float]:
+    async def evaluate(self, log_details: bool = False) -> Tuple[float, float]:
         """Evaluate the model."""
         self.model.eval()
         
@@ -663,46 +674,129 @@ class AgentGRPOTrainer:
         logger.info(f"📊 Evaluating on {len(self.eval_queries)} queries...")
         eval_start = time.time()
         
+        # Display current model info
+        lora_name = self._get_lora_name()
+        logger.info(f"📦 Model info:")
+        if lora_name:
+            logger.info(f"   LoRA: {lora_name}")
+        logger.info(f"   Best accuracy so far: {self.best_accuracy*100:.2f}%")
+        
         with torch.no_grad():
-            with tqdm(total=len(self.eval_queries), desc="🔍 Evaluation", 
-                      unit="query", ncols=100) as pbar:
-                for query in self.eval_queries:
+            if log_details:
+                # Detailed logging like training
+                print(f"\n{'='*80}", flush=True)
+                print(f"🔍 EVALUATION ROLLOUTS", flush=True)
+                print(f"{'='*80}", flush=True)
+                print(f"Total queries: {len(self.eval_queries)}", flush=True)
+                print(f"{'='*80}\n", flush=True)
+                
+                for query_idx, query in enumerate(self.eval_queries):
+                    current_query = query_idx + 1
+                    elapsed = time.time() - eval_start
+                    avg_time = elapsed / current_query if current_query > 0 else 0
+                    remaining = (len(self.eval_queries) - current_query) * avg_time
+                    
+                    # Prepare eval info for logging
+                    eval_info = {
+                        'current_rollout': current_query,
+                        'total_rollouts': len(self.eval_queries),
+                        'elapsed_time': elapsed,
+                        'avg_rollout_time': avg_time,
+                        'step': self.global_step,
+                        'max_steps': self.max_steps,
+                        'query_idx': query_idx,
+                        'total_queries': len(self.eval_queries),
+                        'best_accuracy': self.best_accuracy,
+                        'lora_name': lora_name,
+                    }
+                    
                     conversation, reward, rubric = await execute_rollout(
                         query, self.model, self.tokenizer,
-                        self.policy_config, self.openai_client, verbose=False
+                        self.policy_config, self.openai_client, 
+                        verbose=False,
+                        log_turns=True,
+                        rollout_info=eval_info
                     )
                     all_rewards.append(reward)
                     all_rubrics.append(rubric)
                     
                     if rubric.answer_correct:
                         correct_answers += 1
-                    
-                    # Update progress bar
-                    pbar.set_postfix({
-                        'reward': f'{reward:.2f}',
-                        'correct': f'{correct_answers}/{len(all_rewards)}',
-                        'acc': f'{correct_answers/len(all_rewards)*100:.1f}%'
-                    })
-                    pbar.update(1)
+                
+                print(f"\n{'='*80}", flush=True)
+                print(f"✅ EVALUATION COMPLETE", flush=True)
+                print(f"{'='*80}\n", flush=True)
+            else:
+                # Compact progress bar
+                with tqdm(total=len(self.eval_queries), desc="🔍 Evaluation", 
+                          unit="query", ncols=100) as pbar:
+                    for query in self.eval_queries:
+                        conversation, reward, rubric = await execute_rollout(
+                            query, self.model, self.tokenizer,
+                            self.policy_config, self.openai_client, verbose=False
+                        )
+                        all_rewards.append(reward)
+                        all_rubrics.append(rubric)
+                        
+                        if rubric.answer_correct:
+                            correct_answers += 1
+                        
+                        # Update progress bar
+                        pbar.set_postfix({
+                            'reward': f'{reward:.2f}',
+                            'correct': f'{correct_answers}/{len(all_rewards)}',
+                            'acc': f'{correct_answers/len(all_rewards)*100:.1f}%'
+                        })
+                        pbar.update(1)
         
         eval_time = time.time() - eval_start
         avg_reward = np.mean(all_rewards)
         accuracy = correct_answers / len(self.eval_queries)
         
-        # Detailed evaluation statistics
-        logger.info(f"\n{'─'*80}")
-        logger.info(f"📊 EVALUATION RESULTS")
-        logger.info(f"{'─'*80}")
-        logger.info(f"Time taken: {eval_time:.1f}s ({eval_time/len(self.eval_queries):.2f}s per query)")
-        logger.info(f"Average reward: {avg_reward:.3f} (std: {np.std(all_rewards):.3f})")
-        logger.info(f"Median reward: {np.median(all_rewards):.3f}")
-        logger.info(f"Reward range: [{np.min(all_rewards):.3f}, {np.max(all_rewards):.3f}]")
-        logger.info(f"Accuracy: {accuracy*100:.2f}% ({correct_answers}/{len(self.eval_queries)})")
-        
         # Rubric statistics
         attempted = sum(1 for r in all_rubrics if r.attempted_answer)
         found_email = sum(1 for r in all_rubrics if r.ever_found_right_email)
         read_email = sum(1 for r in all_rubrics if r.ever_read_right_email)
+        
+        # Output detailed evaluation statistics (use print for consistency with detailed logging)
+        if log_details:
+            print(f"\n{'='*80}", flush=True)
+            print(f"📊 EVALUATION RESULTS", flush=True)
+            print(f"{'='*80}", flush=True)
+            if lora_name:
+                print(f"🧩 LoRA: {lora_name}", flush=True)
+            print(f"📈 Best accuracy before: {self.best_accuracy*100:.2f}%", flush=True)
+            print(f"🎯 Current accuracy: {accuracy*100:.2f}% ({correct_answers}/{len(self.eval_queries)})", flush=True)
+            if accuracy > self.best_accuracy:
+                improvement = (accuracy - self.best_accuracy) * 100
+                print(f"   ✨ Improvement: +{improvement:.2f}%", flush=True)
+            elif accuracy < self.best_accuracy:
+                decline = (self.best_accuracy - accuracy) * 100
+                print(f"   ⚠️  Decline: -{decline:.2f}%", flush=True)
+            else:
+                print(f"   ➖ No change", flush=True)
+            print(f"\n⏱️  Time taken: {eval_time:.1f}s ({eval_time/len(self.eval_queries):.2f}s per query)", flush=True)
+            print(f"💰 Average reward: {avg_reward:.3f} (std: {np.std(all_rewards):.3f})", flush=True)
+            print(f"   Median reward: {np.median(all_rewards):.3f}", flush=True)
+            print(f"   Reward range: [{np.min(all_rewards):.3f}, {np.max(all_rewards):.3f}]", flush=True)
+            print(f"\n📊 Rubric Statistics:", flush=True)
+            print(f"   Attempted answer: {attempted}/{len(all_rubrics)} ({attempted/len(all_rubrics)*100:.1f}%)", flush=True)
+            print(f"   Found correct email: {found_email}/{len(all_rubrics)} ({found_email/len(all_rubrics)*100:.1f}%)", flush=True)
+            print(f"   Read correct email: {read_email}/{len(all_rubrics)} ({read_email/len(all_rubrics)*100:.1f}%)", flush=True)
+            print(f"{'='*80}\n", flush=True)
+        
+        # Also log to logger for file logging
+        logger.info(f"\n{'─'*80}")
+        logger.info(f"📊 EVALUATION RESULTS")
+        logger.info(f"{'─'*80}")
+        if lora_name:
+            logger.info(f"LoRA: {lora_name}")
+        logger.info(f"Best accuracy before: {self.best_accuracy*100:.2f}%")
+        logger.info(f"Current accuracy: {accuracy*100:.2f}% ({correct_answers}/{len(self.eval_queries)})")
+        logger.info(f"Time taken: {eval_time:.1f}s ({eval_time/len(self.eval_queries):.2f}s per query)")
+        logger.info(f"Average reward: {avg_reward:.3f} (std: {np.std(all_rewards):.3f})")
+        logger.info(f"Median reward: {np.median(all_rewards):.3f}")
+        logger.info(f"Reward range: [{np.min(all_rewards):.3f}, {np.max(all_rewards):.3f}]")
         logger.info(f"\nRubric Statistics:")
         logger.info(f"  - Attempted answer: {attempted}/{len(all_rubrics)} ({attempted/len(all_rubrics)*100:.1f}%)")
         logger.info(f"  - Found correct email: {found_email}/{len(all_rubrics)} ({found_email/len(all_rubrics)*100:.1f}%)")
@@ -797,7 +891,11 @@ class AgentGRPOTrainer:
         logger.info(f"❌ Tool results will NOT be trained")
         logger.info("="*80)
         
-        step = 0
+        # Initialize step from global_step (for resume support)
+        step = self.global_step
+        if step > 0:
+            logger.info(f"\n🔄 Resuming training from step {step}")
+        
         training_start_time = time.time()
         cumulative_rollout_time = 0
         cumulative_training_time = 0
@@ -810,12 +908,16 @@ class AgentGRPOTrainer:
         while step < self.max_steps:
             step_start_time = time.time()
             
+            # Update step counter at the beginning
+            step += 1
+            self.global_step = step
+            
             # Log detailed information for first 3 steps and every 10 steps after
-            log_details = (step < 3) or (step % 10 == 0)
+            log_details = (step <= 3) or (step % 10 == 0)
             
             if log_details:
                 logger.info(f"\n{'='*80}")
-                logger.info(f"📍 DETAILED LOGGING FOR STEP {step+1}")
+                logger.info(f"📍 DETAILED LOGGING FOR STEP {step}")
                 logger.info(f"{'='*80}")
                 sys.stdout.flush()  # Force flush to ensure immediate display
             
@@ -826,9 +928,6 @@ class AgentGRPOTrainer:
             ).tolist()
             
             metrics = self.training_step(batch_queries, log_details=log_details)
-            
-            step += 1
-            self.global_step = step
             
             cumulative_rollout_time += metrics.rollout_time
             cumulative_training_time += metrics.training_time
@@ -879,28 +978,45 @@ class AgentGRPOTrainer:
                 logger.info(f"🔍 EVALUATION at step {step}")
                 logger.info(f"{'='*80}")
                 
-                avg_reward, accuracy = asyncio.run(self.evaluate())
+                # Step 1: Save checkpoint BEFORE evaluation
+                checkpoint_path = self.output_dir / f"checkpoint-{step}"
+                logger.info(f"\n💾 Saving checkpoint before evaluation: {checkpoint_path}")
+                self.save_model(checkpoint_path, {"step": step})
+                logger.info(f"✓ Checkpoint saved")
                 
+                # Step 2: Evaluate the model (always show detailed logs)
+                avg_reward, accuracy = asyncio.run(self.evaluate(log_details=True))
+                
+                # Step 3: Check if this is a new best model
                 improvement = ""
                 improved = False
                 if accuracy > self.best_accuracy:
                     improvement = f" (+{(accuracy - self.best_accuracy)*100:.2f}%)"
+                    old_best_accuracy = self.best_accuracy
                     self.best_accuracy = accuracy
                     self.best_model_path = self.output_dir / "best_model"
+                    
+                    # Save or update best model pointer
+                    logger.info(f"\n✨ New best accuracy: {accuracy*100:.2f}%{improvement}")
+                    logger.info(f"💾 Updating best model pointer: {self.best_model_path}")
                     self.save_model(
                         self.best_model_path,
                         {"accuracy": accuracy, "reward": avg_reward, "step": step}
                     )
-                    logger.info(f"✨ New best accuracy: {accuracy*100:.2f}%{improvement}")
+                    logger.info(f"✓ Best model updated")
+                    
                     improved = True
                     self.evals_without_improvement = 0  # Reset counter
                 else:
                     self.evals_without_improvement += 1
-                    logger.info(f"⚠️  No improvement for {self.evals_without_improvement} evaluation(s) "
+                    logger.info(f"\n⚠️  No improvement for {self.evals_without_improvement} evaluation(s) "
                                f"(patience: {self.patience})")
+                    logger.info(f"   Current accuracy: {accuracy*100:.2f}%")
+                    logger.info(f"   Best accuracy: {self.best_accuracy*100:.2f}%")
+                    logger.info(f"   Keeping best model at: {self.best_model_path}")
                 
                 progress_to_target = accuracy / self.target_accuracy * 100
-                logger.info(f"📈 Progress to target: {progress_to_target:.1f}% "
+                logger.info(f"\n📈 Progress to target: {progress_to_target:.1f}% "
                            f"({accuracy*100:.1f}% / {self.target_accuracy*100:.1f}%)")
                 
                 # Check if target accuracy reached
@@ -925,8 +1041,8 @@ class AgentGRPOTrainer:
                 
                 logger.info(f"{'='*80}\n")
             
-            # Save checkpoint
-            if step % self.save_steps == 0:
+            # Save checkpoint (only if not already saved during evaluation)
+            if step % self.save_steps == 0 and step % self.eval_steps != 0:
                 checkpoint_path = self.output_dir / f"checkpoint-{step}"
                 self.save_model(checkpoint_path, {"step": step})
                 logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
@@ -937,7 +1053,7 @@ class AgentGRPOTrainer:
         logger.info("🏁 FINAL EVALUATION")
         logger.info(f"{'='*80}")
         
-        avg_reward, accuracy = asyncio.run(self.evaluate())
+        avg_reward, accuracy = asyncio.run(self.evaluate(log_details=True))
         
         logger.info(f"\n{'='*80}")
         logger.info("📊 TRAINING SUMMARY")

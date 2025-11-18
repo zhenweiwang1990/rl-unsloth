@@ -32,6 +32,8 @@ class EvaluationRubric:
     returned_i_dont_know: bool = False
     num_sources: int = 0
     ever_tried_to_read_invalid_email: bool = False
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
     def to_metrics(self) -> Dict[str, float | int]:
         """Convert rubric to metrics dictionary."""
