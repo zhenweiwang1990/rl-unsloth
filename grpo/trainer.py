@@ -1024,6 +1024,19 @@ class AgentGRPOTrainer:
                     
                     improved = True
                     self.evals_without_improvement = 0  # Reset counter
+                    
+                    # Update the checkpoint's training_state.json with new best_accuracy
+                    # This ensures resume from this checkpoint will have the correct best_accuracy
+                    training_state = {
+                        "global_step": self.global_step,
+                        "best_accuracy": self.best_accuracy,
+                        "best_model_path": str(self.best_model_path) if self.best_model_path else None,
+                        "evals_without_improvement": self.evals_without_improvement,
+                    }
+                    training_state_path = checkpoint_path / "training_state.json"
+                    with open(training_state_path, "w") as f:
+                        json.dump(training_state, f, indent=2)
+                    logger.info(f"✓ Checkpoint training_state.json updated with best_accuracy: {self.best_accuracy:.2%}")
                 else:
                     self.evals_without_improvement += 1
                     logger.info(f"\n⚠️  No improvement for {self.evals_without_improvement} evaluation(s) "
@@ -1031,6 +1044,18 @@ class AgentGRPOTrainer:
                     logger.info(f"   Current accuracy: {accuracy*100:.2f}%")
                     logger.info(f"   Best accuracy: {self.best_accuracy*100:.2f}%")
                     logger.info(f"   Keeping best model at: {self.best_model_path}")
+                    
+                    # Still update the checkpoint's training_state.json with current state
+                    training_state = {
+                        "global_step": self.global_step,
+                        "best_accuracy": self.best_accuracy,
+                        "best_model_path": str(self.best_model_path) if self.best_model_path else None,
+                        "evals_without_improvement": self.evals_without_improvement,
+                    }
+                    training_state_path = checkpoint_path / "training_state.json"
+                    with open(training_state_path, "w") as f:
+                        json.dump(training_state, f, indent=2)
+                    logger.info(f"✓ Checkpoint training_state.json updated with evals_without_improvement: {self.evals_without_improvement}")
                 
                 progress_to_target = accuracy / self.target_accuracy * 100
                 logger.info(f"\n📈 Progress to target: {progress_to_target:.1f}% "
