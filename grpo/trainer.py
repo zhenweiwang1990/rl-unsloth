@@ -51,6 +51,7 @@ class AgentGRPOTrainer:
         warmup_steps: int = 10,
         patience: int = 5,  # Early stopping: stop if no improvement for N evaluations
         min_group_std: float = 0.05,  # Minimum reward std to keep a group for training
+        resume_from_checkpoint: Optional[str] = None,  # Path to checkpoint to resume from
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -96,6 +97,10 @@ class AgentGRPOTrainer:
         self.best_accuracy = 0.0
         self.best_model_path = None
         self.evals_without_improvement = 0  # For early stopping
+        
+        # Resume from checkpoint if provided
+        if resume_from_checkpoint:
+            self._load_checkpoint(Path(resume_from_checkpoint))
         
         logger.info("="*60)
         logger.info("AgentGRPOTrainer initialized")
@@ -335,6 +340,26 @@ class AgentGRPOTrainer:
         logger.info(f"{role_emoji} {role.upper():10s} {mask_indicator} ({trainable}/{total} tokens trainable)")
         logger.info(f"   {text_preview}")
     
+    def _get_lora_name(self) -> Optional[str]:
+        """Extract LoRA adapter name from model if available."""
+        try:
+            # Check if model has PEFT adapters
+            if hasattr(self.model, 'peft_config'):
+                adapter_names = list(self.model.peft_config.keys())
+                if adapter_names:
+                    return adapter_names[0]
+            # Check for active adapters
+            if hasattr(self.model, 'active_adapters'):
+                adapters = self.model.active_adapters
+                if adapters and len(adapters) > 0:
+                    return adapters[0] if isinstance(adapters, list) else str(adapters)
+            # Fallback: check if it's a PEFT model
+            if hasattr(self.model, 'base_model'):
+                return "LoRA"
+        except:
+            pass
+        return None
+    
     async def collect_rollouts_for_batch(
         self,
         queries: List[SyntheticQuery],
@@ -372,8 +397,11 @@ class AgentGRPOTrainer:
                         'elapsed_time': elapsed,
                         'avg_rollout_time': avg_time,
                         'step': step_num,
+                        'max_steps': self.max_steps,
                         'query_idx': query_idx,
                         'total_queries': len(queries),
+                        'best_accuracy': self.best_accuracy,
+                        'lora_name': self._get_lora_name(),
                     }
                     
                     conversation, reward, rubric = await execute_rollout(
@@ -684,22 +712,67 @@ class AgentGRPOTrainer:
         return avg_reward, accuracy
     
     def save_model(self, path: Path, metrics: Optional[Dict] = None):
-        """Save model checkpoint."""
+        """Save model checkpoint with full training state."""
         path.mkdir(parents=True, exist_ok=True)
         
+        # Save model and tokenizer
         self.model.save_pretrained(str(path))
         self.tokenizer.save_pretrained(str(path))
         
+        # Save optimizer state
+        torch.save(self.optimizer.state_dict(), path / "optimizer.pt")
+        
+        # Save training state
+        training_state = {
+            "global_step": self.global_step,
+            "best_accuracy": self.best_accuracy,
+            "best_model_path": str(self.best_model_path) if self.best_model_path else None,
+            "evals_without_improvement": self.evals_without_improvement,
+        }
+        with open(path / "training_state.json", "w") as f:
+            json.dump(training_state, f, indent=2)
+        
+        # Save metrics metadata
         if metrics:
             metadata = {
                 "step": self.global_step,
                 "metrics": metrics,
             }
-            
-            with open(path / "metadata.json", "w") as f:
+            with open(path / "training_metadata.json", "w") as f:
                 json.dump(metadata, f, indent=2)
         
-        logger.info(f"💾 Model saved to: {path}")
+        logger.info(f"💾 Model and training state saved to: {path}")
+    
+    def _load_checkpoint(self, checkpoint_path: Path):
+        """Load training state from checkpoint."""
+        logger.info(f"📂 Loading training state from checkpoint: {checkpoint_path}")
+        
+        # Load optimizer state
+        optimizer_path = checkpoint_path / "optimizer.pt"
+        if optimizer_path.exists():
+            self.optimizer.load_state_dict(torch.load(optimizer_path))
+            logger.info("✓ Optimizer state loaded")
+        else:
+            logger.warning("⚠️  Optimizer state not found, starting with fresh optimizer")
+        
+        # Load training state
+        training_state_path = checkpoint_path / "training_state.json"
+        if training_state_path.exists():
+            with open(training_state_path, 'r') as f:
+                training_state = json.load(f)
+            
+            self.global_step = training_state.get("global_step", 0)
+            self.best_accuracy = training_state.get("best_accuracy", 0.0)
+            best_model_path_str = training_state.get("best_model_path")
+            self.best_model_path = Path(best_model_path_str) if best_model_path_str else None
+            self.evals_without_improvement = training_state.get("evals_without_improvement", 0)
+            
+            logger.info(f"✓ Training state loaded:")
+            logger.info(f"  - Global step: {self.global_step}")
+            logger.info(f"  - Best accuracy: {self.best_accuracy:.2%}")
+            logger.info(f"  - Evals without improvement: {self.evals_without_improvement}")
+        else:
+            logger.warning("⚠️  Training state not found, starting from step 0")
     
     def train(self):
         """Main training loop."""

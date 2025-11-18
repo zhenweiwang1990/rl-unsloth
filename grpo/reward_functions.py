@@ -45,6 +45,7 @@ async def execute_rollout(
         
         # 2. Ground truth answer
         print(f"✅ Ground Truth: {query.answer}", flush=True)
+        print(f"📧 Reference Email: {query.message_ids[0]}", flush=True)
         
         # 3. Turn-by-turn actions
         turn_num = 0
@@ -73,18 +74,44 @@ async def execute_rollout(
                                 params = f"keywords={keywords[:3]}"
                                 if from_addr:
                                     params += f", from={from_addr[:20]}"
+                                
+                                # Check next message (tool result) to get search results
+                                search_result_count = 0
+                                has_reference = False
+                                if i + 1 < len(conversation):
+                                    next_msg = conversation[i + 1]
+                                    if next_msg.get('role') == 'tool':
+                                        try:
+                                            tool_result = json.loads(next_msg.get('content', '[]'))
+                                            if isinstance(tool_result, list):
+                                                search_result_count = len(tool_result)
+                                                # Check if reference email is in results
+                                                for result in tool_result:
+                                                    if isinstance(result, dict) and result.get('message_id') == query.message_ids[0]:
+                                                        has_reference = True
+                                                        break
+                                        except:
+                                            pass
+                                
+                                ref_indicator = " ✅ has reference" if has_reference else " ❌ no reference"
+                                print(f"  🔧 Turn {turn_num}: {func_name}({params}) → {search_result_count} results{ref_indicator}", flush=True)
+                                
                             elif func_name == 'read_email':
                                 msg_id = func_args.get('message_id', '')
                                 params = f"msg_id={msg_id[:20]}"
+                                is_reference = (msg_id == query.message_ids[0])
+                                ref_indicator = " ✅ reference email" if is_reference else " ❌ not reference"
+                                print(f"  🔧 Turn {turn_num}: {func_name}({params}){ref_indicator}", flush=True)
+                                
                             elif func_name == 'return_final_answer':
                                 answer = func_args.get('answer', '')
                                 agent_final_answer = answer
                                 sources = func_args.get('source_message_ids', [])
                                 params = f"answer='{answer[:50]}...', sources={len(sources)}"
+                                print(f"  🔧 Turn {turn_num}: {func_name}({params})", flush=True)
                             else:
                                 params = str(func_args)[:50]
-                            
-                            print(f"  🔧 Turn {turn_num}: {func_name}({params})", flush=True)
+                                print(f"  🔧 Turn {turn_num}: {func_name}({params})", flush=True)
                         except:
                             print(f"  🔧 Turn {turn_num}: {func_name}(...)", flush=True)
                             
@@ -111,13 +138,41 @@ async def execute_rollout(
             avg_time = rollout_info.get('avg_rollout_time', 0)
             remaining = (total_rollouts - current_rollout) * avg_time
             step = rollout_info.get('step', 0)
+            max_steps = rollout_info.get('max_steps', 0)
             query_idx = rollout_info.get('query_idx', 0)
             total_queries = rollout_info.get('total_queries', 0)
+            best_accuracy = rollout_info.get('best_accuracy', 0.0)
+            lora_name = rollout_info.get('lora_name')
             
             print(f"{'─'*80}", flush=True)
-            print(f"⏱️  Progress: Rollout {current_rollout}/{total_rollouts} | "
-                  f"Elapsed: {elapsed:.1f}s | ETA: {remaining:.1f}s | "
-                  f"Step: {step} | Query: {query_idx+1}/{total_queries}", flush=True)
+            
+            # Calculate total training time estimate
+            # Total rollouts across all steps = max_steps * batch_size * num_rollouts
+            # We can estimate this from current progress
+            rollouts_per_step = total_rollouts  # This is batch_size * num_rollouts
+            total_rollouts_all_steps = max_steps * rollouts_per_step
+            est_total_time = avg_time * total_rollouts_all_steps
+            
+            # Progress line
+            progress_line = f"⏱️  Progress: Step {step}/{max_steps} ({step/max_steps*100:.1f}%) | "
+            progress_line += f"Rollout {current_rollout}/{total_rollouts} | "
+            progress_line += f"Query {query_idx+1}/{total_queries}"
+            print(progress_line, flush=True)
+            
+            # Time estimates
+            time_line = f"⏰ Time: Batch {elapsed:.1f}s | ETA batch: {remaining:.1f}s | "
+            time_line += f"Est. total training: {est_total_time/3600:.1f}h"
+            print(time_line, flush=True)
+            
+            # LoRA and accuracy info
+            if lora_name or best_accuracy > 0:
+                info_parts = []
+                if lora_name:
+                    info_parts.append(f"LoRA: {lora_name}")
+                if best_accuracy > 0:
+                    info_parts.append(f"Best Accuracy: {best_accuracy*100:.2f}%")
+                if info_parts:
+                    print(f"📊 {' | '.join(info_parts)}", flush=True)
         
         print(f"{'─'*80}\n", flush=True)
     

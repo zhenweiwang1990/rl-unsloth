@@ -100,7 +100,7 @@ docker run --rm -it \
     -e HF_DATASETS_CACHE=/root/.cache/huggingface \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
-    python train_grpo.py --mode $MODE
+    python train_grpo.py --mode $MODE --resume_best
 
 echo ""
 echo "=========================================="

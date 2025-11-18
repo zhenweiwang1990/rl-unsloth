@@ -141,7 +141,6 @@ def search_emails(
     formatted_results = [
         SearchResult(message_id=row[0], snippet=row[1]) for row in results
     ]
-    logging.info(f"Search found {len(formatted_results)} results.")
     return formatted_results
 
 

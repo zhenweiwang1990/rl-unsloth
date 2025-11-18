@@ -40,6 +40,8 @@ from grpo import (
     get_env_int,
     get_env_float,
     prepare_dataset,
+    find_latest_checkpoint,
+    find_best_checkpoint,
 )
 
 # Configure logging with immediate flushing
@@ -53,6 +55,10 @@ logging.basicConfig(
     handlers=[log_handler]
 )
 logger = logging.getLogger(__name__)
+
+# Silence httpx and root logger's INFO messages
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("root").setLevel(logging.WARNING)
 
 # Force unbuffered output
 if hasattr(sys.stdout, 'reconfigure'):
@@ -72,6 +78,22 @@ def main():
         choices=["simple", "rollout", "masked"],
         help="Training mode: simple (fast), rollout (real agent), masked (full, recommended)"
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from latest checkpoint in output_dir"
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to specific checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--resume_best",
+        action="store_true",
+        help="Resume from best checkpoint (highest accuracy) instead of latest"
+    )
     args = parser.parse_args()
     
     # Load configuration
@@ -81,10 +103,10 @@ def main():
         eval_dataset_size=get_env_int("EVAL_DATASET_SIZE", "100"),  # 100 validation questions
         max_steps=get_env_int("MAX_STEPS", "200"),
         learning_rate=get_env_float("LEARNING_RATE", "1e-5"),
-        per_device_train_batch_size=get_env_int("PER_DEVICE_TRAIN_BATCH_SIZE", "8"),  # 8 questions per batch
-        num_generations=get_env_int("NUM_GENERATIONS", "6"),  # 6 rollouts per question
+        per_device_train_batch_size=get_env_int("PER_DEVICE_TRAIN_BATCH_SIZE", "4"),  # 8 questions per batch
+        num_generations=get_env_int("NUM_GENERATIONS", "3"),  # 6 rollouts per question
         beta=get_env_float("BETA", "0.01"),
-        max_turns=get_env_int("MAX_TURNS", "4"),
+        max_turns=get_env_int("MAX_TURNS", "10"),
         max_tokens=get_env_int("MAX_TOKENS", "4096"),
         output_dir=os.environ.get("OUTPUT_DIR", f"outputs/grpo_{args.mode}").split('#')[0].strip(),
         seed=get_env_int("SEED", "42"),
@@ -95,7 +117,7 @@ def main():
         max_turns=config.max_turns,
         max_tokens=config.max_tokens,
         verbose=config.verbose,
-        stupid_simple_reward_fn=True,  # Use simple reward for speed
+        stupid_simple_reward_fn=False,  # Use complex reward with partial credit and penalties
     )
     
     # Force print to ensure output is visible
@@ -131,6 +153,33 @@ def main():
     logger.info(f"Batch size: {config.per_device_train_batch_size}")
     logger.info(f"Output dir: {config.output_dir}")
     
+    # Determine checkpoint to resume from
+    resume_from_checkpoint = None
+    if args.resume_from_checkpoint:
+        # Explicit checkpoint path provided
+        resume_from_checkpoint = args.resume_from_checkpoint
+        print(f"\n📂 Resuming from specified checkpoint: {resume_from_checkpoint}", flush=True)
+        logger.info(f"Resuming from specified checkpoint: {resume_from_checkpoint}")
+    elif args.resume or args.resume_best:
+        # Auto-detect checkpoint
+        if args.resume_best:
+            result = find_best_checkpoint(config.output_dir)
+            if result:
+                resume_from_checkpoint, accuracy = result
+                print(f"\n📂 Resuming from best checkpoint (accuracy: {accuracy:.2%}): {resume_from_checkpoint}", flush=True)
+                logger.info(f"Resuming from best checkpoint (accuracy: {accuracy:.2%}): {resume_from_checkpoint}")
+            else:
+                print("\n⚠️  No checkpoints found, starting from scratch", flush=True)
+                logger.warning("No checkpoints found, starting from scratch")
+        else:
+            resume_from_checkpoint = find_latest_checkpoint(config.output_dir)
+            if resume_from_checkpoint:
+                print(f"\n📂 Resuming from latest checkpoint: {resume_from_checkpoint}", flush=True)
+                logger.info(f"Resuming from latest checkpoint: {resume_from_checkpoint}")
+            else:
+                print("\n⚠️  No checkpoints found, starting from scratch", flush=True)
+                logger.warning("No checkpoints found, starting from scratch")
+    
     # Initialize OpenRouter client (for judge)
     print("\n🔑 Checking OpenRouter API key...", flush=True)
     openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -150,30 +199,46 @@ def main():
     
     # Load model
     print("\n📦 Loading model and tokenizer...", flush=True)
-    print(f"Model: {config.model_name}", flush=True)
     logger.info("Loading model and tokenizer...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config.model_name,
-        max_seq_length=config.max_seq_length,
-        load_in_4bit=config.load_in_4bit,
-        dtype=None,
-    )
     
-    # Apply LoRA
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=config.lora_r,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=config.seed,
-        max_seq_length=config.max_seq_length,
-    )
+    if resume_from_checkpoint:
+        # Load from checkpoint
+        print(f"Loading from checkpoint: {resume_from_checkpoint}", flush=True)
+        logger.info(f"Loading from checkpoint: {resume_from_checkpoint}")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=str(resume_from_checkpoint),
+            max_seq_length=config.max_seq_length,
+            load_in_4bit=config.load_in_4bit,
+            dtype=None,
+        )
+        print("✓ Model and LoRA weights loaded from checkpoint", flush=True)
+        logger.info("✓ Model and LoRA weights loaded from checkpoint")
+    else:
+        # Load base model and apply LoRA
+        print(f"Model: {config.model_name}", flush=True)
+        logger.info(f"Loading base model: {config.model_name}")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=config.model_name,
+            max_seq_length=config.max_seq_length,
+            load_in_4bit=config.load_in_4bit,
+            dtype=None,
+        )
+        
+        # Apply LoRA
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=config.lora_r,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=config.seed,
+            max_seq_length=config.max_seq_length,
+        )
     
     # Configure tokenizer
     if tokenizer.pad_token is None:
@@ -229,12 +294,13 @@ def main():
             max_grad_norm=1.0,
             output_dir=config.output_dir,
             target_accuracy=0.95,
-            eval_steps=30,  # Evaluate every 30 steps
-            save_steps=100,
+            eval_steps=2,  # Evaluate every 30 steps
+            save_steps=4,
             max_steps=config.max_steps,
             warmup_steps=10,
             patience=get_env_int("PATIENCE", "5"),  # Early stopping patience
             min_group_std=get_env_float("MIN_GROUP_STD", "0.05"),  # Minimum std to keep a group
+            resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None,
         )
         os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
         trainer.train()
@@ -311,7 +377,11 @@ def main():
         )
         
         logger.info("Starting training...")
-        trainer.train()
+        if resume_from_checkpoint:
+            logger.info(f"Resuming from checkpoint: {resume_from_checkpoint}")
+            trainer.train(resume_from_checkpoint=str(resume_from_checkpoint))
+        else:
+            trainer.train()
         
         logger.info("Training complete!")
         
