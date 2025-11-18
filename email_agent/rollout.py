@@ -34,6 +34,11 @@ class EvaluationRubric:
     ever_tried_to_read_invalid_email: bool = False
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    
+    # Repetition tracking
+    num_repeated_searches: int = 0  # Number of times the agent repeated the exact same search
+    num_zero_result_searches: int = 0  # Number of searches that returned 0 results
+    repeated_zero_result_search: bool = False  # Did agent repeat a search that already returned 0 results?
 
     def to_metrics(self) -> Dict[str, float | int]:
         """Convert rubric to metrics dictionary."""
@@ -62,24 +67,35 @@ def calculate_reward(
     partial_rewards += 0.1 if rubric.ever_read_right_email else 0
     partial_rewards += 0.1 if not rubric.ever_tried_to_read_invalid_email else 0
     partial_rewards += 0.1 if rubric.sources_correct else 0
+    
+    # Penalty for repeated searches (inefficiency)
+    # Each repeated identical search costs -0.15 points
+    repetition_penalty = 0.0
+    if rubric.num_repeated_searches > 0:
+        repetition_penalty += 0.15 * rubric.num_repeated_searches
+    
+    # Extra penalty if agent repeated a search that already returned 0 results
+    # This shows poor learning/adaptation
+    if rubric.repeated_zero_result_search:
+        repetition_penalty += 0.15
 
     # Formatting errors: -2 to -1
     if rubric.cant_parse_tool_call:
-        return -2 + partial_rewards
+        return -2 + partial_rewards - repetition_penalty
 
     if rubric.bad_tool_call_name:
-        return -1.9 + partial_rewards
+        return -1.9 + partial_rewards - repetition_penalty
 
     if rubric.bad_tool_call_args:
-        return -1.8 + partial_rewards
+        return -1.8 + partial_rewards - repetition_penalty
 
     # Wrong answer: -1 to 0
     if rubric.attempted_answer and not rubric.answer_correct:
-        return -1 + partial_rewards
+        return -1 + partial_rewards - repetition_penalty
 
     # No answer: 0 to 1
     if rubric.returned_i_dont_know or rubric.ran_out_of_turns:
-        return 0 + partial_rewards
+        return 0 + partial_rewards - repetition_penalty
 
     # Correct answer: 1 to 2
     if rubric.answer_correct:
@@ -87,10 +103,12 @@ def calculate_reward(
         reward += 0.3 if rubric.sources_correct else 0
         reward += 0.1 / rubric.num_sources if rubric.num_sources > 0 else 0
         reward += 0.1 * (1 - rubric.num_turns / max(policy_config.max_turns, 1))
+        # Subtract repetition penalty from correct answers too
+        reward -= repetition_penalty
         return reward
 
     logger.warning(f"Rubric not handled properly: {rubric}")
-    return 0.0
+    return 0.0 - repetition_penalty
 
 
 async def determine_if_answer_is_correct(

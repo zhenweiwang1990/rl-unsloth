@@ -24,6 +24,8 @@ async def execute_rollout(
     verbose: bool = False,
     log_turns: bool = False,
     rollout_info: Dict = None,
+    rollout_index: int = 0,
+    num_rollouts: int = 4,
 ):
     """Execute a real agent rollout."""
     from email_agent.agent import EmailAgent
@@ -33,6 +35,8 @@ async def execute_rollout(
         tokenizer=tokenizer,
         policy_config=policy_config,
         openai_client=openai_client,
+        rollout_index=rollout_index,
+        num_rollouts=num_rollouts,
     )
     
     rubric, conversation = await agent.run_query(query, verbose=verbose)
@@ -164,15 +168,27 @@ async def execute_rollout(
             time_line += f"Est. total training: {est_total_time/3600:.1f}h"
             print(time_line, flush=True)
             
-            # LoRA and accuracy info
+            # Model checkpoint and accuracy info
+            is_evaluation = rollout_info.get('is_evaluation', False)
+            is_training = rollout_info.get('is_training', False)
             if lora_name or best_accuracy > 0:
                 info_parts = []
                 if lora_name:
-                    info_parts.append(f"LoRA: {lora_name}")
+                    # Display model state info
+                    if is_evaluation:
+                        # Evaluation uses the saved checkpoint
+                        checkpoint_num = lora_name.replace('step-', '')
+                        info_parts.append(f"📍 Checkpoint: {checkpoint_num} (evaluating)")
+                    elif is_training:
+                        # Training collects rollouts for this step (using previous checkpoint weights)
+                        training_step = lora_name.replace('training-step-', '')
+                        info_parts.append(f"🎲 Collecting: step {training_step}")
+                    else:
+                        info_parts.append(f"📍 {lora_name}")
                 if best_accuracy > 0:
-                    info_parts.append(f"Best Accuracy: {best_accuracy*100:.2f}%")
+                    info_parts.append(f"Best: {best_accuracy*100:.2f}%")
                 if info_parts:
-                    print(f"📊 {' | '.join(info_parts)}", flush=True)
+                    print(f"{' | '.join(info_parts)}", flush=True)
         
         print(f"{'─'*80}\n", flush=True)
     
@@ -273,6 +289,8 @@ def rollout_reward_function(
                     policy_config=policy_config,
                     openai_client=openai_client,
                     verbose=False,
+                    rollout_index=0,  # Use base temperature for single rollouts
+                    num_rollouts=1,
                 )
             )
             

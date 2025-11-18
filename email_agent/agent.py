@@ -36,6 +36,8 @@ class EmailAgent:
         tokenizer,
         policy_config: PolicyConfig,
         openai_client: Optional[AsyncOpenAI] = None,
+        rollout_index: int = 0,
+        num_rollouts: int = 4,
     ):
         """Initialize the agent.
         
@@ -44,12 +46,16 @@ class EmailAgent:
             tokenizer: The tokenizer (transformers AutoTokenizer)
             policy_config: Policy configuration
             openai_client: OpenAI client for judge (optional, only needed for evaluation)
+            rollout_index: Index of this rollout within its group (0 to num_rollouts-1)
+            num_rollouts: Total number of rollouts in the group
         """
         self.model = model
         self.tokenizer = tokenizer
         self.policy_config = policy_config
         self.openai_client = openai_client
         self.tools = get_tools_schema()
+        self.rollout_index = rollout_index
+        self.num_rollouts = num_rollouts
         
     async def run_query(
         self,
@@ -66,6 +72,10 @@ class EmailAgent:
             Tuple of (rubric, conversation_history)
         """
         rubric = EvaluationRubric()
+        
+        # Track tool call history to detect repetitions
+        # Key: (tool_name, normalized_args), Value: result (for zero-result detection)
+        tool_call_history = {}
         
         # Create initial conversation
         system_prompt = create_system_prompt(query, self.policy_config.max_turns)
@@ -116,6 +126,7 @@ class EmailAgent:
                         query,
                         rubric,
                         conversation,
+                        tool_call_history,
                         verbose,
                     )
                     if should_break:
@@ -201,10 +212,28 @@ class EmailAgent:
         inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
         input_tokens = inputs.input_ids.shape[1]
         
+        # Calculate dynamic temperature and repetition penalty based on rollout index
+        # This encourages exploration diversity within each group of rollouts
+        if self.policy_config.enable_dynamic_temperature:
+            temperature = self.policy_config.base_temperature + (
+                self.rollout_index * self.policy_config.temperature_increment
+            )
+            repetition_penalty = self.policy_config.base_repetition_penalty + (
+                self.rollout_index * self.policy_config.repetition_penalty_increment
+            )
+            
+            if verbose:
+                print(f"🎲 Rollout {self.rollout_index + 1}/{self.num_rollouts}: "
+                      f"temp={temperature:.2f}, rep_penalty={repetition_penalty:.2f}")
+        else:
+            temperature = 0.7
+            repetition_penalty = 1.0
+        
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=self.policy_config.max_tokens,
-            temperature=0.7,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
             do_sample=True,
             pad_token_id=self.tokenizer.pad_token_id,
         )
@@ -397,6 +426,7 @@ class EmailAgent:
         query: SyntheticQuery,
         rubric: EvaluationRubric,
         conversation: List[Dict],
+        tool_call_history: Dict,
         verbose: bool,
     ) -> bool:
         """Execute tool calls and update conversation.
@@ -406,6 +436,7 @@ class EmailAgent:
             query: The query being processed
             rubric: Evaluation rubric to update
             conversation: Conversation history to update
+            tool_call_history: History of previous tool calls for repetition detection
             verbose: Whether to print logs
             
         Returns:
@@ -449,6 +480,7 @@ class EmailAgent:
                 tool_args,
                 query,
                 rubric,
+                tool_call_history,
                 verbose,
             )
             
@@ -485,6 +517,7 @@ class EmailAgent:
         tool_args: Dict[str, Any],
         query: SyntheticQuery,
         rubric: EvaluationRubric,
+        tool_call_history: Dict,
         verbose: bool,
     ) -> Tuple[Any, bool]:
         """Execute a single tool call.
@@ -494,6 +527,7 @@ class EmailAgent:
             tool_args: Tool arguments
             query: The query being processed
             rubric: Evaluation rubric to update
+            tool_call_history: History of previous tool calls for repetition detection
             verbose: Whether to print logs
             
         Returns:
@@ -503,6 +537,32 @@ class EmailAgent:
         
         if tool_name == "search_emails":
             try:
+                # Create a normalized key for this search to detect repetitions
+                # Sort keywords for consistent comparison
+                keywords = tool_args.get('keywords', [])
+                if isinstance(keywords, list):
+                    keywords = sorted(keywords)
+                search_key = (
+                    tool_name,
+                    tuple(keywords) if isinstance(keywords, list) else keywords,
+                    tool_args.get('from_addr', ''),
+                    tool_args.get('to_addr', ''),
+                )
+                
+                # Check if this exact search was already performed
+                if search_key in tool_call_history:
+                    rubric.num_repeated_searches += 1
+                    prev_result = tool_call_history[search_key]
+                    
+                    # Check if repeating a zero-result search
+                    if prev_result == 0:
+                        rubric.repeated_zero_result_search = True
+                    
+                    if verbose:
+                        print(f"\n⚠️  WARNING: Repeating identical search!")
+                        print(f"   This search was already performed and returned {prev_result} results")
+                        print(f"   Repetition penalty will be applied")
+                
                 if verbose:
                     print(f"\n🔍 Executing search_emails...")
                     print(f"   Keywords: {tool_args.get('keywords', [])}")
@@ -516,6 +576,13 @@ class EmailAgent:
                     inbox=query.inbox_address,
                 )
                 result = [asdict(r) for r in search_results]
+                
+                # Track this search in history
+                tool_call_history[search_key] = len(search_results)
+                
+                # Track zero-result searches
+                if len(search_results) == 0:
+                    rubric.num_zero_result_searches += 1
                 
                 # Check if we found the right email
                 found_right = False
@@ -629,6 +696,16 @@ class EmailAgent:
         print(f"Read right email: {'✓' if rubric.ever_read_right_email else '✗'}")
         print(f"Answer correct: {'✓' if rubric.answer_correct else '✗'}")
         print(f"Sources correct: {'✓' if rubric.sources_correct else '✗'}")
+        
+        # Show efficiency metrics
+        if rubric.num_repeated_searches > 0 or rubric.num_zero_result_searches > 0:
+            print(f"\n⚠️  Efficiency Issues:")
+            if rubric.num_repeated_searches > 0:
+                print(f"   Repeated identical searches: {rubric.num_repeated_searches}")
+            if rubric.repeated_zero_result_search:
+                print(f"   Repeated zero-result search: ✗ (extra penalty)")
+            if rubric.num_zero_result_searches > 0:
+                print(f"   Total zero-result searches: {rubric.num_zero_result_searches}")
         
         # Calculate reward
         reward = calculate_reward(self.policy_config, rubric)

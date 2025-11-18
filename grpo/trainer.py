@@ -72,6 +72,7 @@ class AgentGRPOTrainer:
         self.warmup_steps = warmup_steps
         self.patience = patience
         self.min_group_std = min_group_std
+        self.verbose = policy_config.verbose  # Control logging verbosity
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -115,6 +116,7 @@ class AgentGRPOTrainer:
         logger.info(f"Target accuracy: {target_accuracy*100:.1f}%")
         logger.info(f"Early stopping patience: {patience} evaluations")
         logger.info(f"Min group std for training: {min_group_std:.3f} (filters low-variance groups)")
+        logger.info(f"Verbose logging: {self.verbose} (detailed rollout logs: {'enabled' if self.verbose else 'disabled'})")
         logger.info("="*60)
     
     def tokenize_conversation_with_mask(
@@ -393,6 +395,9 @@ class AgentGRPOTrainer:
                     avg_time = elapsed / current_rollout if current_rollout > 0 else 0
                     
                     # Prepare rollout info for logging
+                    # For training rollouts, indicate we're collecting data for this step
+                    # The model weights are from the last saved checkpoint
+                    model_identifier = f"training-step-{step_num}" if step_num > 0 else "initial"
                     rollout_info = {
                         'current_rollout': current_rollout,
                         'total_rollouts': total_rollouts,
@@ -403,7 +408,8 @@ class AgentGRPOTrainer:
                         'query_idx': query_idx,
                         'total_queries': len(queries),
                         'best_accuracy': self.best_accuracy,
-                        'lora_name': self._get_lora_name(),
+                        'lora_name': model_identifier,
+                        'is_training': True,
                     }
                     
                     conversation, reward, rubric = await execute_rollout(
@@ -411,7 +417,9 @@ class AgentGRPOTrainer:
                         self.policy_config, self.openai_client, 
                         verbose=False,
                         log_turns=log_rollouts,
-                        rollout_info=rollout_info if log_rollouts else None
+                        rollout_info=rollout_info if log_rollouts else None,
+                        rollout_index=rollout_idx,
+                        num_rollouts=self.num_rollouts,
                     )
                     trajectories.append(conversation)
                     rewards.append(reward)
@@ -675,10 +683,10 @@ class AgentGRPOTrainer:
         eval_start = time.time()
         
         # Display current model info
-        lora_name = self._get_lora_name()
+        # At evaluation time, we're evaluating the checkpoint that was just saved
+        model_identifier = f"{self.global_step}"
         logger.info(f"📦 Model info:")
-        if lora_name:
-            logger.info(f"   LoRA: {lora_name}")
+        logger.info(f"   Evaluating checkpoint: {model_identifier}")
         logger.info(f"   Best accuracy so far: {self.best_accuracy*100:.2f}%")
         
         with torch.no_grad():
@@ -688,6 +696,7 @@ class AgentGRPOTrainer:
                 print(f"🔍 EVALUATION ROLLOUTS", flush=True)
                 print(f"{'='*80}", flush=True)
                 print(f"Total queries: {len(self.eval_queries)}", flush=True)
+                print(f"Checkpoint: {model_identifier}", flush=True)
                 print(f"{'='*80}\n", flush=True)
                 
                 for query_idx, query in enumerate(self.eval_queries):
@@ -707,7 +716,8 @@ class AgentGRPOTrainer:
                         'query_idx': query_idx,
                         'total_queries': len(self.eval_queries),
                         'best_accuracy': self.best_accuracy,
-                        'lora_name': lora_name,
+                        'lora_name': f"step-{model_identifier}",
+                        'is_evaluation': True,
                     }
                     
                     conversation, reward, rubric = await execute_rollout(
@@ -715,7 +725,9 @@ class AgentGRPOTrainer:
                         self.policy_config, self.openai_client, 
                         verbose=False,
                         log_turns=True,
-                        rollout_info=eval_info
+                        rollout_info=eval_info,
+                        rollout_index=0,  # Evaluation uses single rollout with base temperature
+                        num_rollouts=1,
                     )
                     all_rewards.append(reward)
                     all_rubrics.append(rubric)
@@ -733,7 +745,9 @@ class AgentGRPOTrainer:
                     for query in self.eval_queries:
                         conversation, reward, rubric = await execute_rollout(
                             query, self.model, self.tokenizer,
-                            self.policy_config, self.openai_client, verbose=False
+                            self.policy_config, self.openai_client, verbose=False,
+                            rollout_index=0,  # Evaluation uses single rollout with base temperature
+                            num_rollouts=1,
                         )
                         all_rewards.append(reward)
                         all_rubrics.append(rubric)
@@ -763,8 +777,7 @@ class AgentGRPOTrainer:
             print(f"\n{'='*80}", flush=True)
             print(f"📊 EVALUATION RESULTS", flush=True)
             print(f"{'='*80}", flush=True)
-            if lora_name:
-                print(f"🧩 LoRA: {lora_name}", flush=True)
+            print(f"🧩 Checkpoint: {model_identifier}", flush=True)
             print(f"📈 Best accuracy before: {self.best_accuracy*100:.2f}%", flush=True)
             print(f"🎯 Current accuracy: {accuracy*100:.2f}% ({correct_answers}/{len(self.eval_queries)})", flush=True)
             if accuracy > self.best_accuracy:
@@ -789,8 +802,7 @@ class AgentGRPOTrainer:
         logger.info(f"\n{'─'*80}")
         logger.info(f"📊 EVALUATION RESULTS")
         logger.info(f"{'─'*80}")
-        if lora_name:
-            logger.info(f"LoRA: {lora_name}")
+        logger.info(f"Checkpoint: {model_identifier}")
         logger.info(f"Best accuracy before: {self.best_accuracy*100:.2f}%")
         logger.info(f"Current accuracy: {accuracy*100:.2f}% ({correct_answers}/{len(self.eval_queries)})")
         logger.info(f"Time taken: {eval_time:.1f}s ({eval_time/len(self.eval_queries):.2f}s per query)")
@@ -912,14 +924,16 @@ class AgentGRPOTrainer:
             step += 1
             self.global_step = step
             
-            # Log detailed information for first 3 steps and every 10 steps after
-            log_details = (step <= 3) or (step % 10 == 0)
+            # Use verbose setting to control logging detail level
+            log_details = self.verbose
             
             if log_details:
                 logger.info(f"\n{'='*80}")
-                logger.info(f"📍 DETAILED LOGGING FOR STEP {step}")
+                logger.info(f"📍 STEP {step}")
                 logger.info(f"{'='*80}")
                 sys.stdout.flush()  # Force flush to ensure immediate display
+            else:
+                logger.info(f"\n📍 Step {step}/{self.max_steps}")
             
             batch_queries = np.random.choice(
                 self.train_queries,
@@ -968,8 +982,11 @@ class AgentGRPOTrainer:
             logger.info(f"   Moving avg (last {len(recent_accuracies)}): {np.mean(recent_accuracies)*100:.1f}%")
             logger.info(f"   Best: {self.best_accuracy*100:.1f}%")
             logger.info(f"\n🔢 Tokens:")
-            logger.info(f"   Trainable: {metrics.num_trainable_tokens:,}/{metrics.num_total_tokens:,} "
-                       f"({metrics.num_trainable_tokens/metrics.num_total_tokens*100:.1f}%)")
+            if metrics.num_total_tokens > 0:
+                logger.info(f"   Trainable: {metrics.num_trainable_tokens:,}/{metrics.num_total_tokens:,} "
+                           f"({metrics.num_trainable_tokens/metrics.num_total_tokens*100:.1f}%)")
+            else:
+                logger.info(f"   Trainable: {metrics.num_trainable_tokens:,}/{metrics.num_total_tokens:,} (N/A - no tokens)")
             logger.info(f"{'─'*80}")
             
             # Evaluate
@@ -984,8 +1001,8 @@ class AgentGRPOTrainer:
                 self.save_model(checkpoint_path, {"step": step})
                 logger.info(f"✓ Checkpoint saved")
                 
-                # Step 2: Evaluate the model (always show detailed logs)
-                avg_reward, accuracy = asyncio.run(self.evaluate(log_details=True))
+                # Step 2: Evaluate the model (use verbose setting)
+                avg_reward, accuracy = asyncio.run(self.evaluate(log_details=self.verbose))
                 
                 # Step 3: Check if this is a new best model
                 improvement = ""
@@ -1053,6 +1070,7 @@ class AgentGRPOTrainer:
         logger.info("🏁 FINAL EVALUATION")
         logger.info(f"{'='*80}")
         
+        # Final evaluation: always show details regardless of verbose setting
         avg_reward, accuracy = asyncio.run(self.evaluate(log_details=True))
         
         logger.info(f"\n{'='*80}")

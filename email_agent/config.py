@@ -58,4 +58,11 @@ class PolicyConfig(BaseModel):
     use_tools: bool = True
     stupid_simple_reward_fn: bool = False
     verbose: bool = False
+    
+    # Sampling diversity settings (for GRPO exploration)
+    enable_dynamic_temperature: bool = True
+    base_temperature: float = 0.5
+    temperature_increment: float = 0.2
+    base_repetition_penalty: float = 1.0
+    repetition_penalty_increment: float = 0.05
 
