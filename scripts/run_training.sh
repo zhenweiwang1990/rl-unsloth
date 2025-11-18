@@ -1,9 +1,43 @@
 #!/bin/bash
 set -e
 
+# Parse command line arguments
+MODE="${1:-masked}"  # Default to masked mode
+
+# Validate mode
+if [[ ! "$MODE" =~ ^(simple|rollout|masked)$ ]]; then
+    echo "Error: Invalid mode '$MODE'"
+    echo ""
+    echo "Usage: $0 [MODE]"
+    echo ""
+    echo "Available modes:"
+    echo "  simple   - Fast training with heuristic rewards (for testing)"
+    echo "  rollout  - Training with real agent rollouts"
+    echo "  masked   - Full implementation with token-level masking (RECOMMENDED, default)"
+    echo ""
+    exit 1
+fi
+
 echo "=========================================="
 echo "Email Agent GRPO Training (Docker)"
+echo "Mode: $MODE"
 echo "=========================================="
+echo ""
+
+case $MODE in
+    simple)
+        echo "ℹ️  Simple mode: Fast training with heuristic rewards"
+        echo "   Use this for quick testing and validation"
+        ;;
+    rollout)
+        echo "ℹ️  Rollout mode: Training with real agent rollouts"
+        echo "   More accurate but slower than simple mode"
+        ;;
+    masked)
+        echo "ℹ️  Masked mode: Full token-level masking (RECOMMENDED)"
+        echo "   Most accurate, only trains on model-generated tokens"
+        ;;
+esac
 echo ""
 
 # Docker image name
@@ -13,7 +47,9 @@ IMAGE_NAME="email-agent-grpo"
 ENV_FILE=""
 if [ -f ".env" ]; then
     ENV_FILE="--env-file .env"
-    echo "Loading environment from .env file"
+    echo "✓ Loading environment from .env file"
+else
+    echo "ℹ️  No .env file found, using default settings"
 fi
 
 # Check if database exists
@@ -41,9 +77,15 @@ else
 fi
 
 # Run training in Docker
-echo "Starting GRPO training in Docker..."
+echo "=========================================="
+echo "Starting Training"
+echo "=========================================="
+echo "Training mode: $MODE"
 echo "Cache directory: $HOME/.cache/huggingface"
-ls -lah "$HOME/.cache/huggingface" 2>/dev/null || echo "Cache directory not found"
+ls -lah "$HOME/.cache/huggingface" 2>/dev/null || echo "⚠️  Cache directory not found"
+echo ""
+echo "💡 Tip: You can change modes with:"
+echo "   ./scripts/run_training.sh simple|rollout|masked"
 echo ""
 
 docker run --rm -it \
@@ -55,14 +97,20 @@ docker run --rm -it \
     -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
-    -e TRANSFORMERS_CACHE=/root/.cache/huggingface \
     -e HF_DATASETS_CACHE=/root/.cache/huggingface \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
-    python train_grpo.py
+    python train_grpo.py --mode $MODE
 
 echo ""
 echo "=========================================="
 echo "Training Complete!"
 echo "=========================================="
-echo "Checkpoints saved to: $(pwd)/outputs"
+echo "Mode: $MODE"
+echo "Checkpoints saved to: $(pwd)/outputs/grpo_$MODE"
+echo ""
+echo "To use a different mode, run:"
+echo "  ./scripts/run_training.sh simple   # Fast testing"
+echo "  ./scripts/run_training.sh rollout  # Real rollouts"
+echo "  ./scripts/run_training.sh masked   # Token masking (default)"
+echo ""

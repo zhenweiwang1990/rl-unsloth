@@ -19,7 +19,9 @@ RUN pip3 install --upgrade pip
 COPY requirements.txt .
 # Use BuildKit cache mount to speed up pip installs across builds
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -r requirements.txt
+    pip3 install -r requirements.txt && \
+    # Remove deprecated pynvml and install nvidia-ml-py to fix warnings
+    pip3 uninstall -y pynvml 2>/dev/null || true
 
 # Copy the entire project
 COPY . .
