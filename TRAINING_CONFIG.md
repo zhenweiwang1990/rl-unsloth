@@ -17,7 +17,7 @@ You can set these via environment variables or a `.env` file:
 
 ```bash
 # Model Configuration
-MODEL_NAME=unsloth/Qwen3-14B-Base
+MODEL_NAME=OpenPipe/Qwen3-14B-Instruct
 
 # Dataset Configuration
 TRAIN_DATASET_SIZE=3000          # Number of training questions

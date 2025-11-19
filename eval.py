@@ -35,7 +35,7 @@ async def evaluate_model(
     logger.info(f"Loading model from {model_path}")
     
     # Get base model name from environment
-    base_model_name = os.environ.get("MODEL_NAME", "unsloth/Qwen3-14B-Base")
+    base_model_name = os.environ.get("MODEL_NAME", "OpenPipe/Qwen3-14B-Instruct")
     max_seq_length = int(os.environ.get("MAX_SEQ_LENGTH", "8192"))
     
     # Load model with unsloth optimization

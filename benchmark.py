@@ -10,6 +10,7 @@ from tqdm import tqdm
 import polars as pl
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 from email_agent.config import PolicyConfig
 from email_agent.data import load_synthetic_queries
@@ -30,6 +31,70 @@ def get_env_int(key: str, default: str) -> int:
     # Remove inline comments (everything after #)
     value = value.split('#')[0].strip()
     return int(value)
+
+
+def build_summary_table(df: pl.DataFrame) -> pl.DataFrame:
+    """Create a summary table with key benchmark statistics."""
+    if df.height == 0:
+        return pl.DataFrame({"metric": [], "value": []})
+    
+    def _mean(column: str) -> float:
+        return float(df[column].mean())
+    
+    def _sum(column: str) -> int:
+        return int(df[column].sum())
+    
+    rows = [
+        {"metric": "Average Reward", "value": _mean("reward")},
+        {"metric": "Answer Accuracy", "value": _mean("answer_correct")},
+        {"metric": "Source Accuracy", "value": _mean("sources_correct")},
+        {"metric": "Average Turns", "value": _mean("num_turns")},
+        {"metric": "Attempted Answer Rate", "value": _mean("attempted_answer")},
+        {"metric": "Found Right Email Rate", "value": _mean("ever_found_right_email")},
+        {"metric": "Read Right Email Rate", "value": _mean("ever_read_right_email")},
+        {"metric": "Ran Out of Turns (count)", "value": _sum("ran_out_of_turns")},
+        {"metric": "Ran Out of Turns (rate)", "value": _mean("ran_out_of_turns")},
+        {"metric": "Returned I Don't Know (count)", "value": _sum("returned_i_dont_know")},
+        {"metric": "Returned I Don't Know (rate)", "value": _mean("returned_i_dont_know")},
+        {"metric": "Can't Parse Tool Call (count)", "value": _sum("cant_parse_tool_call")},
+        {"metric": "Can't Parse Tool Call (rate)", "value": _mean("cant_parse_tool_call")},
+        {"metric": "Bad Tool Name (count)", "value": _sum("bad_tool_call_name")},
+        {"metric": "Bad Tool Name (rate)", "value": _mean("bad_tool_call_name")},
+        {"metric": "Bad Tool Args (count)", "value": _sum("bad_tool_call_args")},
+        {"metric": "Bad Tool Args (rate)", "value": _mean("bad_tool_call_args")},
+    ]
+    
+    return pl.DataFrame(rows)
+
+
+def format_summary_table(summary_df: pl.DataFrame) -> str:
+    """Format the summary table for clean logging output."""
+    if summary_df.height == 0:
+        return "No benchmark data available."
+    
+    rows = summary_df.to_dicts()
+    formatted_rows = []
+    for row in rows:
+        value = row["value"]
+        if isinstance(value, float):
+            value_str = f"{value:.3f}"
+        else:
+            value_str = str(value)
+        formatted_rows.append((row["metric"], value_str))
+    
+    metric_header = "Metric"
+    value_header = "Value"
+    metric_width = max(len(metric_header), *(len(metric) for metric, _ in formatted_rows))
+    value_width = max(len(value_header), *(len(value) for _, value in formatted_rows))
+    
+    header = f"{metric_header.ljust(metric_width)} | {value_header.rjust(value_width)}"
+    divider = f"{'-' * metric_width}-+-{'-' * value_width}"
+    body = [
+        f"{metric.ljust(metric_width)} | {value.rjust(value_width)}"
+        for metric, value in formatted_rows
+    ]
+    
+    return "\n".join([header, divider, *body])
 
 
 
@@ -61,7 +126,7 @@ async def benchmark_model(
     )
     
     # Get base model name from environment
-    base_model_name = os.environ.get("MODEL_NAME", "unsloth/Qwen3-14B-Base")
+    base_model_name = os.environ.get("MODEL_NAME", "OpenPipe/Qwen3-14B-Instruct")
     max_seq_length = get_env_int("MAX_SEQ_LENGTH", "8192")
             
     # Load model with unsloth optimization
@@ -74,7 +139,7 @@ async def benchmark_model(
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model_name,
             max_seq_length=max_seq_length,
-            load_in_4bit=True,  # Use 4-bit quantization for faster inference
+            load_in_4bit=False,  # Use 4-bit quantization for faster inference
             dtype=None,  # Auto-detect
         )
         
@@ -89,7 +154,7 @@ async def benchmark_model(
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=base_model_name,
             max_seq_length=max_seq_length,
-            load_in_4bit=True,  # Use 4-bit quantization for faster inference
+            load_in_4bit=False,  # Use 4-bit quantization for faster inference
             dtype=None,  # Auto-detect
         )
         logger.info("✓ Base model loaded successfully")
@@ -267,6 +332,9 @@ async def main():
         verbose=verbose,
     )
     
+    summary_table = build_summary_table(results)
+    summary_table_path: Optional[Path] = None
+    
     # Save results to outputs directory (mounted from host)
     if args.output:
         output_path = args.output
@@ -279,6 +347,14 @@ async def main():
     results.write_csv(output_path)
     logger.info(f"\n✓ Results saved to {output_path}")
     
+    # Derive summary path (same directory as results)
+    result_path = Path(output_path)
+    summary_path = result_path.with_name(f"{result_path.stem}_summary.csv")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_table.write_csv(summary_path.as_posix())
+    summary_table_path = summary_path
+    logger.info(f"✓ Summary table saved to {summary_path}")
+    
     # Print final summary
     logger.info("")
     logger.info("="*60)
@@ -287,24 +363,10 @@ async def main():
     logger.info(f"Model: {args.model_path if args.model_path else 'Base model (no fine-tuning)'}")
     logger.info(f"Total queries evaluated: {len(results)}")
     logger.info(f"Results file: {output_path}")
+    logger.info(f"Summary file: {summary_table_path}" if summary_table_path else "Summary file: None")
     logger.info("")
-    logger.info("Key Metrics:")
-    logger.info(f"  • Average Reward: {results['reward'].mean():.3f}")
-    logger.info(f"  • Answer Accuracy: {results['answer_correct'].mean():.1%}")
-    logger.info(f"  • Source Accuracy: {results['sources_correct'].mean():.1%}")
-    logger.info(f"  • Average Turns: {results['num_turns'].mean():.2f}")
-    logger.info("")
-    logger.info("Success Indicators:")
-    logger.info(f"  • Attempted Answer: {results['attempted_answer'].sum()}/{len(results)} ({results['attempted_answer'].mean():.1%})")
-    logger.info(f"  • Found Right Email: {results['ever_found_right_email'].sum()}/{len(results)} ({results['ever_found_right_email'].mean():.1%})")
-    logger.info(f"  • Read Right Email: {results['ever_read_right_email'].sum()}/{len(results)} ({results['ever_read_right_email'].mean():.1%})")
-    logger.info("")
-    logger.info("Error Analysis:")
-    logger.info(f"  • Ran Out of Turns: {results['ran_out_of_turns'].sum()} ({results['ran_out_of_turns'].mean():.1%})")
-    logger.info(f"  • Returned 'I Don't Know': {results['returned_i_dont_know'].sum()} ({results['returned_i_dont_know'].mean():.1%})")
-    logger.info(f"  • Parse Errors: {results['cant_parse_tool_call'].sum()} ({results['cant_parse_tool_call'].mean():.1%})")
-    logger.info(f"  • Bad Tool Name: {results['bad_tool_call_name'].sum()} ({results['bad_tool_call_name'].mean():.1%})")
-    logger.info(f"  • Bad Tool Args: {results['bad_tool_call_args'].sum()} ({results['bad_tool_call_args'].mean():.1%})")
+    logger.info("Summary Metrics:")
+    logger.info("\n%s", format_summary_table(summary_table))
     logger.info("="*60)
 
 

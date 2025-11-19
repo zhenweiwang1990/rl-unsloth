@@ -163,7 +163,7 @@ This makes rewards more comparable across different queries.
 
 ## Model Details
 
-- **Base Model**: [unsloth/Qwen3-14B-Base](https://huggingface.co/unsloth/Qwen3-14B-Base)
+- **Base Model**: [OpenPipe/Qwen3-14B-Instruct](https://huggingface.co/OpenPipe/Qwen3-14B-Instruct)
 - **Method**: LoRA fine-tuning (rank 16, alpha 16)
 - **Quantization**: 4-bit quantization with unsloth
 - **Target Modules**: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj

@@ -8,7 +8,7 @@ class GRPOConfig(BaseModel):
     """GRPO training configuration."""
     
     # Model settings
-    model_name: str = "unsloth/Qwen3-14B-Base"
+    model_name: str = "OpenPipe/Qwen3-14B-Instruct"
     max_seq_length: int = 8192
     load_in_4bit: bool = True
     
@@ -26,8 +26,8 @@ class GRPOConfig(BaseModel):
     max_steps: int = 1000
     warmup_steps: int = 10
     logging_steps: int = 1
-    eval_steps: int = 2
-    save_steps: int = 2
+    eval_steps: int = 10
+    save_steps: int = 10
     
     # GRPO-specific
     beta: float = 0.0  # KL divergence weight (0.0 = no KL penalty)
@@ -47,7 +47,7 @@ class GRPOConfig(BaseModel):
     
     # Misc
     seed: int = 42
-    verbose: bool = False
+    verbose: bool = True
 
 
 class PolicyConfig(BaseModel):
@@ -57,7 +57,7 @@ class PolicyConfig(BaseModel):
     max_tokens: int = 4096
     use_tools: bool = True
     stupid_simple_reward_fn: bool = False
-    verbose: bool = False
+    verbose: bool = True
     
     # Sampling diversity settings (for GRPO exploration)
     enable_dynamic_temperature: bool = True

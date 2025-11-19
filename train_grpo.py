@@ -23,6 +23,7 @@ import logging
 from functools import partial
 
 import torch
+import wandb
 from unsloth import FastLanguageModel
 from trl import GRPOConfig as TRLGRPOConfig, GRPOTrainer
 from openai import AsyncOpenAI
@@ -98,7 +99,7 @@ def main():
     
     # Load configuration
     config = GRPOConfig(
-        model_name=os.environ.get("MODEL_NAME", "unsloth/Qwen3-14B-Base").split('#')[0].strip(),
+        model_name=os.environ.get("MODEL_NAME", "OpenPipe/Qwen3-14B-Instruct").split('#')[0].strip(),
         train_dataset_size=get_env_int("TRAIN_DATASET_SIZE", "3000"),
         eval_dataset_size=get_env_int("EVAL_DATASET_SIZE", "100"),  # 100 validation questions
         max_steps=get_env_int("MAX_STEPS", "200"),
@@ -112,6 +113,42 @@ def main():
         seed=get_env_int("SEED", "42"),
         verbose=os.environ.get("VERBOSE", "false").split('#')[0].strip().lower() == "true",
     )
+    
+    # Initialize wandb
+    wandb_project = os.environ.get("WANDB_PROJECT", "email-agent-grpo")
+    wandb_entity = os.environ.get("WANDB_ENTITY", None)
+    wandb_name = os.environ.get("WANDB_NAME", f"grpo-{args.mode}")
+    wandb_mode = os.environ.get("WANDB_MODE", "online")  # online, offline, disabled
+    
+    if wandb_mode != "disabled":
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_name,
+            mode=wandb_mode,
+            config={
+                "mode": args.mode,
+                "model_name": config.model_name,
+                "train_dataset_size": config.train_dataset_size,
+                "eval_dataset_size": config.eval_dataset_size,
+                "max_steps": config.max_steps,
+                "learning_rate": config.learning_rate,
+                "batch_size": config.per_device_train_batch_size,
+                "num_generations": config.num_generations,
+                "beta": config.beta,
+                "max_turns": config.max_turns,
+                "max_tokens": config.max_tokens,
+                "output_dir": config.output_dir,
+                "seed": config.seed,
+                "verbose": config.verbose,
+            },
+            tags=[args.mode, "grpo", "email-agent"],
+        )
+        print(f"✓ Wandb initialized: project={wandb_project}, name={wandb_name}", flush=True)
+        logger.info(f"✓ Wandb initialized: project={wandb_project}, name={wandb_name}")
+    else:
+        print("⚠ Wandb disabled (WANDB_MODE=disabled)", flush=True)
+        logger.info("⚠ Wandb disabled")
     
     policy_config = PolicyConfig(
         max_turns=config.max_turns,
@@ -202,17 +239,23 @@ def main():
     logger.info("Loading model and tokenizer...")
     
     if resume_from_checkpoint:
-        # Load from checkpoint
-        print(f"Loading from checkpoint: {resume_from_checkpoint}", flush=True)
-        logger.info(f"Loading from checkpoint: {resume_from_checkpoint}")
+        # Load base model first, then LoRA adapter from checkpoint
+        print(f"Loading base model: {config.model_name}", flush=True)
+        logger.info(f"Loading base model: {config.model_name}")
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=str(resume_from_checkpoint),
+            model_name=config.model_name,
             max_seq_length=config.max_seq_length,
             load_in_4bit=config.load_in_4bit,
             dtype=None,
         )
-        print("✓ Model and LoRA weights loaded from checkpoint", flush=True)
-        logger.info("✓ Model and LoRA weights loaded from checkpoint")
+        
+        # Load LoRA adapter from checkpoint
+        print(f"Loading LoRA adapter from checkpoint: {resume_from_checkpoint}", flush=True)
+        logger.info(f"Loading LoRA adapter from checkpoint: {resume_from_checkpoint}")
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(resume_from_checkpoint))
+        print("✓ Base model and LoRA adapter loaded", flush=True)
+        logger.info("✓ Base model and LoRA adapter loaded")
     else:
         # Load base model and apply LoRA
         print(f"Model: {config.model_name}", flush=True)
@@ -290,20 +333,25 @@ def main():
             learning_rate=config.learning_rate,
             beta=config.beta,
             batch_size=config.per_device_train_batch_size,  # 8 questions per batch = 48 trajectories total
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=get_env_int("GRADIENT_ACCUMULATION_STEPS", "1"),
             max_grad_norm=1.0,
             output_dir=config.output_dir,
             target_accuracy=0.95,
-            eval_steps=2,  # Evaluate every 2 steps
-            save_steps=4,
+            eval_steps=10,  # Evaluate every 2 steps
+            save_steps=10,
             max_steps=config.max_steps,
             warmup_steps=10,
             patience=get_env_int("PATIENCE", "5"),  # Early stopping patience
             min_group_std=get_env_float("MIN_GROUP_STD", "0.05"),  # Minimum std to keep a group
             resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None,
+            use_wandb=wandb_mode != "disabled",
         )
         os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
         trainer.train()
+        
+        # Finish wandb run
+        if wandb_mode != "disabled":
+            wandb.finish()
         
     else:
         # Simple or rollout mode using TRL
@@ -337,6 +385,7 @@ def main():
             num_generation_per_prompt=config.num_generations,
             max_new_tokens=config.max_tokens,
             temperature=0.7,
+            report_to="wandb" if wandb_mode != "disabled" else None,
         )
         
         # Select reward function
@@ -401,6 +450,10 @@ def main():
             logger.info(f"Best model: {accuracy_callback.best_model_path}")
             logger.info(f"Best accuracy: {accuracy_callback.best_accuracy * 100:.2f}%")
         logger.info("="*60)
+        
+        # Finish wandb run
+        if wandb_mode != "disabled":
+            wandb.finish()
     
     logger.info("Done!")
 

@@ -39,6 +39,12 @@ class EvaluationRubric:
     num_repeated_searches: int = 0  # Number of times the agent repeated the exact same search
     num_zero_result_searches: int = 0  # Number of searches that returned 0 results
     repeated_zero_result_search: bool = False  # Did agent repeat a search that already returned 0 results?
+    
+    # Search effort tracking
+    num_unique_searches: int = 0  # Number of unique searches (different parameters)
+    num_total_searches: int = 0  # Total number of search attempts (including repeats)
+    num_retry_after_zero: int = 0  # Number of times agent tried different search after getting 0 results (good behavior)
+    gave_up_too_early: bool = False  # Did agent give up with "I don't know" after too few unique searches?
 
     def to_metrics(self) -> Dict[str, float | int]:
         """Convert rubric to metrics dictionary."""
@@ -93,12 +99,98 @@ def calculate_reward(
     if rubric.attempted_answer and not rubric.answer_correct:
         return -1 + partial_rewards - repetition_penalty
 
-    # No answer: 0 to 1
+    # Handle "no answer" cases - distinguish between early give-up and running out of turns
+    # 
+    # Two scenarios:
+    # 1. Agent returns "I don't know" BEFORE exhausting turn budget → SEVERE PENALTY
+    #    (This is bad: agent should continue searching until budget is exhausted)
+    # 2. Agent runs out of turns (with or without "I don't know") → REWARD if effort was made
+    #    (This is acceptable: agent tried hard but couldn't find answer)
+    #
     if rubric.returned_i_dont_know or rubric.ran_out_of_turns:
-        return 0 + partial_rewards - repetition_penalty
+        base_reward = 0 + partial_rewards - repetition_penalty
+        
+        # SEVERE PENALTY for giving up BEFORE running out of turns
+        # This encourages the agent to continue searching until turn budget is exhausted
+        # Note: If agent returns "I don't know" in the last turn, ran_out_of_turns will be True,
+        # so this penalty won't apply (which is correct - they exhausted the budget)
+        if rubric.returned_i_dont_know and not rubric.ran_out_of_turns:
+            # Agent gave up early - this is BAD behavior
+            # Penalty increases with how early they gave up
+            min_expected_searches = 3
+            early_giveup_penalty = 0.0
+            
+            if rubric.num_unique_searches < min_expected_searches:
+                # Severe penalty: -0.5 per missing search, up to -1.5
+                missing_searches = min_expected_searches - rubric.num_unique_searches
+                early_giveup_penalty = 0.5 * missing_searches
+            
+            # Additional penalty for giving up before exhausting turns
+            # This is the main penalty - giving up early is worse than running out of turns
+            early_giveup_penalty += 1.0  # Base penalty for early give-up
+            
+            rubric.gave_up_too_early = True
+            logger.warning(
+                f"Agent gave up EARLY (before turn budget exhausted): "
+                f"only {rubric.num_unique_searches} unique searches. "
+                f"Total penalty: -{early_giveup_penalty:.2f}"
+            )
+            base_reward -= early_giveup_penalty
+        
+        # REWARD for running out of turns after making good effort
+        # This encourages continuing to search until turn budget is exhausted
+        # (This applies whether or not agent returned "I don't know" after running out)
+        if rubric.ran_out_of_turns:
+            # Agent exhausted turn budget - this is acceptable if they made effort
+            effort_bonus = 0.0
+            
+            # Reward for making multiple unique searches (showing effort)
+            if rubric.num_unique_searches >= 3:
+                # Good effort: tried multiple different searches
+                effort_bonus = 0.2
+                if rubric.num_unique_searches >= 5:
+                    # Excellent effort: tried many different searches
+                    effort_bonus = 0.3
+                logger.info(
+                    f"Agent ran out of turns after good effort: "
+                    f"{rubric.num_unique_searches} unique searches. Bonus: +{effort_bonus:.2f}"
+                )
+            
+            # REWARD for trying different search parameters after zero results
+            # This encourages adaptive behavior
+            if rubric.num_retry_after_zero > 0:
+                retry_bonus = 0.1 * rubric.num_retry_after_zero
+                effort_bonus += retry_bonus
+                logger.info(
+                    f"Agent tried different search parameters after zero results "
+                    f"({rubric.num_retry_after_zero} times). Bonus: +{retry_bonus:.2f}"
+                )
+            
+            base_reward += effort_bonus
+        
+        return base_reward
 
     # Correct answer: 1 to 2
     if rubric.answer_correct:
+        # PERFECT CASE: First turn search, second turn read, third turn answer
+        # This is the ideal behavior - give full marks directly
+        is_perfect = (
+            rubric.num_turns == 3 and
+            rubric.ever_found_right_email and
+            rubric.ever_read_right_email and
+            rubric.sources_correct and
+            rubric.num_repeated_searches == 0 and
+            rubric.num_zero_result_searches == 0
+        )
+        
+        if is_perfect:
+            logger.info(
+                f"Perfect execution: 3 turns (search→read→answer), "
+                f"found and read correct email, correct answer. Full marks: 2.0"
+            )
+            return 2.0  # Full marks for perfect case
+        
+        # Normal correct answer calculation
         reward = 1.0
         reward += 0.3 if rubric.sources_correct else 0
         reward += 0.1 / rubric.num_sources if rubric.num_sources > 0 else 0
@@ -117,7 +209,7 @@ async def determine_if_answer_is_correct(
     openai_client: AsyncOpenAI,
     verbose: bool = False
 ) -> bool:
-    """Use Gemini 2.5 Flash (via OpenRouter) to determine if the answer is correct.
+    """Use LLM judge model (via OpenRouter) to determine if the answer is correct.
     
     Args:
         answer: The answer provided by the agent

@@ -549,10 +549,15 @@ class EmailAgent:
                     tool_args.get('to_addr', ''),
                 )
                 
+                # Track total searches
+                rubric.num_total_searches += 1
+                
                 # Check if this exact search was already performed
-                if search_key in tool_call_history:
+                is_repeat = search_key in tool_call_history
+                prev_result = tool_call_history.get(search_key, None)
+                
+                if is_repeat:
                     rubric.num_repeated_searches += 1
-                    prev_result = tool_call_history[search_key]
                     
                     # Check if repeating a zero-result search
                     if prev_result == 0:
@@ -562,6 +567,9 @@ class EmailAgent:
                         print(f"\n⚠️  WARNING: Repeating identical search!")
                         print(f"   This search was already performed and returned {prev_result} results")
                         print(f"   Repetition penalty will be applied")
+                else:
+                    # This is a unique search (different parameters)
+                    rubric.num_unique_searches += 1
                 
                 if verbose:
                     print(f"\n🔍 Executing search_emails...")
@@ -577,12 +585,23 @@ class EmailAgent:
                 )
                 result = [asdict(r) for r in search_results]
                 
-                # Track this search in history
+                # Track this search in history (update or add)
                 tool_call_history[search_key] = len(search_results)
                 
                 # Track zero-result searches
+                num_zero_before = rubric.num_zero_result_searches
                 if len(search_results) == 0:
                     rubric.num_zero_result_searches += 1
+                
+                # Check if this is a retry after a previous zero-result search
+                # (Good behavior: trying different parameters after getting no results)
+                if not is_repeat and num_zero_before > 0:
+                    # This is a unique search and we had zero-result searches before
+                    # This means the agent is trying different parameters after getting no results
+                    rubric.num_retry_after_zero += 1
+                    if verbose:
+                        print(f"\n✓ Good: Trying different search parameters after zero results "
+                              f"(retry #{rubric.num_retry_after_zero})")
                 
                 # Check if we found the right email
                 found_right = False
@@ -697,8 +716,15 @@ class EmailAgent:
         print(f"Answer correct: {'✓' if rubric.answer_correct else '✗'}")
         print(f"Sources correct: {'✓' if rubric.sources_correct else '✗'}")
         
-        # Show efficiency metrics
-        if rubric.num_repeated_searches > 0 or rubric.num_zero_result_searches > 0:
+        # Show search effort metrics
+        print(f"\n📊 Search Metrics:")
+        print(f"   Unique searches: {rubric.num_unique_searches}")
+        print(f"   Total searches: {rubric.num_total_searches}")
+        if rubric.num_retry_after_zero > 0:
+            print(f"   ✓ Retries after zero results: {rubric.num_retry_after_zero} (good behavior)")
+        
+        # Show efficiency issues
+        if rubric.num_repeated_searches > 0 or rubric.num_zero_result_searches > 0 or rubric.gave_up_too_early:
             print(f"\n⚠️  Efficiency Issues:")
             if rubric.num_repeated_searches > 0:
                 print(f"   Repeated identical searches: {rubric.num_repeated_searches}")
@@ -706,9 +732,32 @@ class EmailAgent:
                 print(f"   Repeated zero-result search: ✗ (extra penalty)")
             if rubric.num_zero_result_searches > 0:
                 print(f"   Total zero-result searches: {rubric.num_zero_result_searches}")
+            if rubric.gave_up_too_early:
+                if rubric.ran_out_of_turns:
+                    print(f"   ⚠️  Ran out of turns: {rubric.num_unique_searches} unique searches")
+                else:
+                    print(f"   ✗ Gave up EARLY (before turn budget exhausted): "
+                          f"only {rubric.num_unique_searches} unique searches "
+                          f"(expected at least 3) - SEVERE PENALTY")
         
         # Calculate reward
         reward = calculate_reward(self.policy_config, rubric)
-        print(f"\n🎯 Final Reward: {reward:.3f}")
+        
+        # Check if this is a perfect case
+        is_perfect = (
+            rubric.num_turns == 3 and
+            rubric.ever_found_right_email and
+            rubric.ever_read_right_email and
+            rubric.answer_correct and
+            rubric.sources_correct and
+            rubric.num_repeated_searches == 0 and
+            rubric.num_zero_result_searches == 0
+        )
+        
+        if is_perfect:
+            print(f"\n🌟 PERFECT EXECUTION: 3 turns (search→read→answer)")
+            print(f"🎯 Final Reward: {reward:.3f} (FULL MARKS)")
+        else:
+            print(f"\n🎯 Final Reward: {reward:.3f}")
         print(f"{'='*80}\n")
 
