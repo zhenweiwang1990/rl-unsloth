@@ -646,9 +646,13 @@ class AgentGRPOTrainer:
                             if func_name == 'search_emails':
                                 keywords = func_args.get('keywords', [])
                                 from_addr = func_args.get('from_addr', '')
-                                params = f"keywords={keywords[:3]}"
+                                # Note: inbox is not in func_args, it's added by the agent from query.inbox_address
+                                # Include it in the log for debugging
+                                params = f"keywords={keywords}"
                                 if from_addr:
-                                    params += f", from={from_addr[:20]}"
+                                    params += f", from_addr={from_addr[:20]}"
+                                # Add inbox to make it clear when searches differ
+                                params += f", inbox={query.inbox_address[:30]}"
                                 
                                 # Check next message (tool result) to get search results
                                 search_result_count = 0

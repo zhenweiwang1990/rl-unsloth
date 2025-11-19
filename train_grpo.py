@@ -278,7 +278,7 @@ def main():
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             bias="none",
-            use_gradient_checkpointing="unsloth",
+            use_gradient_checkpointing=True,  # Fallback to standard checkpointing as "unsloth" has issues with Qwen3
             random_state=config.seed,
             max_seq_length=config.max_seq_length,
         )
