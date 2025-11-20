@@ -38,12 +38,13 @@ class TrajectorySample:
     """Single trajectory collected from a rollout."""
 
     query_id: str
+    query: SyntheticQuery  # 新增：用于计算过程奖励
     conversation: List[Dict]
     reward: float
     rubric: EvaluationRubric
     rollout_idx: int
     group_id: int
-    advantage: Optional[float] = None
+    advantage: Optional[float] = None  # 保留用于group-level计算
 
 
 @dataclass
@@ -63,7 +64,7 @@ class TokenizedTrajectory:
     labels: torch.Tensor
     loss_mask: torch.Tensor
     attention_mask: torch.Tensor
-    advantage: float
+    advantage_mask: torch.Tensor  # 改为token-level的advantage mask
     group_id: int
     query_id: str
     old_logprobs: Optional[torch.Tensor] = None
@@ -185,15 +186,138 @@ class AgentGRPOTrainer:
         logger.info(f"Wandb logging: {'enabled' if self.use_wandb else 'disabled'}")
         logger.info("="*60)
     
+    def _compute_action_advantage(
+        self,
+        msg: Dict,
+        rubric: EvaluationRubric,
+        query: SyntheticQuery,
+        msg_idx: int,
+        conversation: List[Dict],
+        trajectory_advantage: float,  # Group-level advantage作为baseline
+    ) -> float:
+        """计算单个action的过程奖励（token-level advantage）.
+        
+        这个方法为每个assistant action（tool call）计算独立的优势值，
+        而不是使用统一的trajectory-level advantage。
+        
+        Args:
+            msg: 当前消息（assistant的tool call）
+            rubric: 评估指标，包含整个trajectory的表现
+            query: 原始查询，包含ground truth
+            msg_idx: 消息在conversation中的索引
+            conversation: 完整的对话历史
+            trajectory_advantage: Group-level的advantage，作为baseline
+            
+        Returns:
+            该action的advantage值（可以是正或负）
+        """
+        tool_calls = msg.get("tool_calls", [])
+        
+        if not tool_calls:
+            # 如果没有tool calls，使用trajectory-level advantage
+            return trajectory_advantage
+        
+        # 获取下一条消息（tool result）来判断action效果
+        next_msg = conversation[msg_idx + 1] if msg_idx + 1 < len(conversation) else None
+        
+        # 处理每个tool call（通常一个action只有一个tool call）
+        for tc in tool_calls:
+            func_name = tc.get("function", {}).get("name")
+            func_args_str = tc.get("function", {}).get("arguments", "{}")
+            
+            # 解析参数
+            try:
+                func_args = json.loads(func_args_str) if isinstance(func_args_str, str) else func_args_str
+            except:
+                # 解析错误，严重惩罚（比trajectory_advantage更负）
+                return min(trajectory_advantage - 1.5, -2.0)
+            
+            # === 1. 搜索动作（search_emails）===
+            if func_name == "search_emails":
+                # 检查搜索结果
+                if next_msg and next_msg.get("role") == "tool":
+                    try:
+                        tool_result = json.loads(next_msg.get("content", "[]"))
+                        if isinstance(tool_result, list):
+                            has_reference = False
+                            result_count = len(tool_result)
+                            
+                            # 检查是否找到了正确的邮件
+                            for result in tool_result:
+                                if isinstance(result, dict) and result.get("message_id") == query.message_ids[0]:
+                                    has_reference = True
+                                    break
+                            
+                            # 找到了正确的邮件 → 给予正向奖励（独立于最终结果）
+                            if has_reference:
+                                # 这是好的搜索！即使最终答案错了，这步也是对的
+                                return max(trajectory_advantage + 0.8, 0.3)  # 至少给0.3的正奖励
+                            
+                            # 搜索返回了结果但没找到正确邮件
+                            if result_count > 0:
+                                # 有结果但不对，轻微负面（说明搜索策略需要改进）
+                                return trajectory_advantage - 0.2
+                            else:
+                                # 空结果，稍微负面（可能是正常的探索）
+                                return trajectory_advantage - 0.15
+                    except:
+                        pass
+                # 无法判断结果，使用baseline
+                return trajectory_advantage
+            
+            # === 2. 阅读动作（read_email）===
+            elif func_name == "read_email":
+                msg_id = func_args.get("message_id", "")
+                
+                # 阅读了正确的邮件 → 给予正向奖励
+                if msg_id == query.message_ids[0]:
+                    # 这是好的阅读！即使最终答案错了，这步也是对的
+                    return max(trajectory_advantage + 0.8, 0.3)  # 至少给0.3的正奖励
+                else:
+                    # 阅读了错误的邮件 → 轻微惩罚
+                    return trajectory_advantage - 0.25
+            
+            # === 3. 最终答案（return_final_answer）===
+            elif func_name == "return_final_answer":
+                # 这是最关键的action，直接使用rubric判断
+                if rubric.answer_correct:
+                    # 正确答案 → 强正向奖励
+                    return max(trajectory_advantage + 1.5, 1.0)  # 至少给1.0的强正奖励
+                else:
+                    # 错误答案 → 强负向惩罚
+                    return min(trajectory_advantage - 1.5, -0.8)  # 至少给-0.8的惩罚
+            
+            # === 4. 错误的工具名称 ===
+            elif func_name not in ["search_emails", "read_email", "return_final_answer"]:
+                # 调用了不存在的工具 → 严重惩罚
+                return min(trajectory_advantage - 1.2, -1.5)
+        
+        # 默认：使用trajectory-level advantage
+        return trajectory_advantage
+    
     def tokenize_conversation_with_mask(
         self,
         conversation: List[Dict],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tokenize conversation and create loss mask."""
+        rubric: Optional[EvaluationRubric] = None,
+        query: Optional[SyntheticQuery] = None,
+        trajectory_advantage: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize conversation and create loss mask with process-based advantages.
+        
+        Args:
+            conversation: 对话历史
+            rubric: 评估指标（可选，用于计算过程奖励）
+            query: 原始查询（可选，用于计算过程奖励）
+            trajectory_advantage: Group-level advantage（用作baseline）
+            
+        Returns:
+            input_ids, labels, loss_mask, advantage_mask
+        """
         all_tokens = []
         all_masks = []
+        all_advantages = []  # 新增：每个token的advantage值
         
-        for msg in conversation:
+        for msg_idx, msg in enumerate(conversation):
             role = msg.get("role", "")
             content = msg.get("content", "")
             tool_calls = msg.get("tool_calls")
@@ -221,39 +345,59 @@ class AgentGRPOTrainer:
             # Tokenize
             tokens = self.tokenizer.encode(text, add_special_tokens=False)
             
-            # Create mask
+            # Create mask and advantages
             if is_model_generated:
                 mask = [1.0] * len(tokens)
+                
+                # 计算这个action的过程奖励（token-level advantage）
+                if rubric is not None and query is not None:
+                    action_advantage = self._compute_action_advantage(
+                        msg, rubric, query, msg_idx, conversation, trajectory_advantage
+                    )
+                else:
+                    # 如果没有提供rubric和query，使用trajectory-level advantage
+                    action_advantage = trajectory_advantage
+                
+                advantages = [action_advantage] * len(tokens)
             else:
                 mask = [0.0] * len(tokens)
+                advantages = [0.0] * len(tokens)  # 非assistant tokens的advantage设为0
             
             all_tokens.extend(tokens)
             all_masks.extend(mask)
+            all_advantages.extend(advantages)
         
         # Add EOS
         all_tokens.append(self.tokenizer.eos_token_id)
         all_masks.append(0.0)
+        all_advantages.append(0.0)
         
         input_ids = torch.tensor(all_tokens, dtype=torch.long)
         labels = input_ids.clone()
         loss_mask = torch.tensor(all_masks, dtype=torch.float)
+        advantage_mask = torch.tensor(all_advantages, dtype=torch.float)
         
-        return input_ids, labels, loss_mask
+        return input_ids, labels, loss_mask, advantage_mask
     
     def compute_loss_for_trajectory(
         self,
         conversation: List[Dict],
         advantage: float,
+        rubric: Optional[EvaluationRubric] = None,
+        query: Optional[SyntheticQuery] = None,
         log_mask: bool = False,
         trajectory_idx: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute loss for a single trajectory with token masking."""
-        input_ids, labels, loss_mask = self.tokenize_conversation_with_mask(conversation)
+        """Compute loss for a single trajectory with token masking and process-based advantages."""
+        input_ids, labels, loss_mask, advantage_mask = self.tokenize_conversation_with_mask(
+            conversation, rubric, query, advantage
+        )
         
         device = next(self.model.parameters()).device
         input_ids = input_ids.unsqueeze(0).to(device)
         labels = labels.unsqueeze(0).to(device)
         loss_mask = loss_mask.to(device)
+        advantage_mask = advantage_mask.to(device)
         
         # Log token mask visualization
         if log_mask:
@@ -267,6 +411,7 @@ class AgentGRPOTrainer:
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
         shift_mask = loss_mask[1:].contiguous()
+        shift_advantage = advantage_mask[1:].contiguous()
         
         # Compute token losses
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
@@ -275,8 +420,9 @@ class AgentGRPOTrainer:
             shift_labels.view(-1)
         )
         
-        # Apply mask
-        masked_losses = token_losses * shift_mask
+        # Apply mask AND token-level advantages (process-based rewards)
+        # 每个token的loss根据其对应action的advantage进行加权
+        masked_losses = token_losses * shift_mask * shift_advantage
         
         num_trainable_tokens = shift_mask.sum().item()
         num_total_tokens = shift_mask.numel()
@@ -284,8 +430,8 @@ class AgentGRPOTrainer:
         if num_trainable_tokens == 0:
             policy_loss = torch.tensor(0.0, device=device)
         else:
-            avg_loss = masked_losses.sum() / shift_mask.sum()
-            policy_loss = advantage * avg_loss
+            # 使用加权平均（已经在masked_losses中包含了advantage）
+            policy_loss = masked_losses.sum() / shift_mask.sum()
         
         # KL divergence
         kl_loss = torch.tensor(0.0, device=device)
@@ -759,6 +905,7 @@ class AgentGRPOTrainer:
             
             return TrajectorySample(
                 query_id=query.id,
+                query=query,  # 添加query，用于计算process-based rewards
                 conversation=conversation,
                 reward=reward,
                 rubric=rubric,
@@ -829,7 +976,7 @@ class AgentGRPOTrainer:
         return kept_samples, {"groups_kept": groups_kept, "groups_filtered": groups_filtered}
     
     def _tokenize_samples(self, samples: List[TrajectorySample]) -> List[TokenizedTrajectory]:
-        """Tokenize trajectories and enforce max sequence length."""
+        """Tokenize trajectories and enforce max sequence length with process-based advantages."""
         tokenized: List[TokenizedTrajectory] = []
         max_len = self.max_seq_length or 8192
         
@@ -837,7 +984,13 @@ class AgentGRPOTrainer:
             if sample.advantage is None:
                 continue
             
-            input_ids, labels, loss_mask = self.tokenize_conversation_with_mask(sample.conversation)
+            # 使用process-based rewards: 传入rubric和query来计算token-level advantages
+            input_ids, labels, loss_mask, advantage_mask = self.tokenize_conversation_with_mask(
+                sample.conversation,
+                rubric=sample.rubric,
+                query=sample.query,
+                trajectory_advantage=sample.advantage,  # Group-level advantage作为baseline
+            )
             seq_len = input_ids.size(0)
             if seq_len < 2:
                 continue
@@ -846,6 +999,7 @@ class AgentGRPOTrainer:
             input_ids = input_ids[:trunc_len].cpu()
             labels = labels[:trunc_len].cpu()
             loss_mask = loss_mask[:trunc_len].cpu()
+            advantage_mask = advantage_mask[:trunc_len].cpu()  # 截断advantage_mask
             
             if loss_mask[1:].sum() == 0:
                 continue
@@ -858,7 +1012,7 @@ class AgentGRPOTrainer:
                     labels=labels,
                     loss_mask=loss_mask,
                     attention_mask=attention_mask,
-                    advantage=sample.advantage,
+                    advantage_mask=advantage_mask,  # 使用token-level的advantage_mask
                     group_id=sample.group_id,
                     query_id=sample.query_id,
                 )
@@ -941,7 +1095,9 @@ class AgentGRPOTrainer:
             trunc_input = sample.input_ids[:trunc_len]
             trunc_labels = sample.labels[:trunc_len]
             trunc_mask = sample.loss_mask[:trunc_len]
+            trunc_advantage = sample.advantage_mask[:trunc_len]  # 使用token-level的advantage_mask
             shift_mask = trunc_mask[1:]
+            shift_advantage = trunc_advantage[1:]  # Shift advantage mask to match logprobs
             
             if shift_mask.sum() == 0:
                 continue
@@ -953,7 +1109,8 @@ class AgentGRPOTrainer:
             label_list.append(trunc_labels)
             mask_list.append(trunc_mask)
             old_logprob_list.append(trunc_old_logprobs)
-            advantage_list.append(torch.full_like(trunc_old_logprobs, sample.advantage))
+            # 使用token-level的advantage（process-based rewards）
+            advantage_list.append(shift_advantage[:len(trunc_old_logprobs)])
             weight_list.append(torch.full_like(trunc_old_logprobs, weight))
         
         if not input_list:
