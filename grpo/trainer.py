@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -760,46 +760,64 @@ class AgentGRPOTrainer:
         
         return turn_advantages
 
-    def _print_turn_advantage_table(
+    def _print_all_groups_advantage_tables(
         self,
-        sorted_samples: List["TrajectorySample"],
+        groups: List[TrajectoryGroup],
     ) -> None:
-        """打印每个 rollout 的每轮 advantage 变化表格。
+        """Print turn-by-turn advantage tables for all groups in the step.
         
         Args:
-            sorted_samples: Sorted list of trajectory samples
+            groups: List of trajectory groups with computed advantages
         """
-        # 找出最大 turn 数
-        max_turns = max((s.rubric.num_turns for s in sorted_samples), default=0)
-        if max_turns == 0:
-            return
+        print(f"\n{'='*80}", flush=True)
+        print(f"📊 TURN-BY-TURN ADVANTAGE TABLES (Step {self.global_step})", flush=True)
+        print(f"{'='*80}", flush=True)
         
-        print(f"\n{'─'*80}", flush=True)
-        print(f"📊 Turn-by-Turn Advantage Table:", flush=True)
-        print(f"{'─'*80}", flush=True)
-        
-        # 打印表头
-        header = "Rollout |"
-        for turn in range(1, max_turns + 1):
-            header += f" Turn {turn:2d} |"
-        print(header, flush=True)
-        print("─" * len(header), flush=True)
-        
-        # 打印每个 rollout 的 advantage
-        for sample in sorted_samples:
-            if sample.turn_advantages is None:
+        for group_idx, group in enumerate(groups):
+            if not group.samples:
                 continue
             
-            row = f"   {sample.rollout_idx + 1:2d}  |"
-            for turn_idx in range(max_turns):
-                if turn_idx < len(sample.turn_advantages):
-                    adv = sample.turn_advantages[turn_idx]
-                    row += f" {adv:+6.3f} |"
-                else:
-                    row += "   ---  |"
-            print(row, flush=True)
+            # Sort samples by rollout index
+            sorted_samples = sorted(group.samples, key=lambda s: s.rollout_idx)
+            
+            # Check if any sample has turn_advantages computed
+            has_advantages = any(s.turn_advantages is not None for s in sorted_samples)
+            if not has_advantages:
+                continue
+            
+            # Find max turns for this group
+            max_turns = max((s.rubric.num_turns for s in sorted_samples), default=0)
+            if max_turns == 0:
+                continue
+            
+            print(f"\n{'─'*80}", flush=True)
+            print(f"📊 Group {group_idx + 1}: {group.query.question[:60]}...", flush=True)
+            print(f"{'─'*80}", flush=True)
+            
+            # Print header
+            header = "Rollout |"
+            for turn in range(1, max_turns + 1):
+                header += f" Turn {turn:2d} |"
+            print(header, flush=True)
+            print("─" * len(header), flush=True)
+            
+            # Print each rollout's advantages
+            for sample in sorted_samples:
+                if sample.turn_advantages is None:
+                    continue
+                
+                row = f"   {sample.rollout_idx + 1:2d}  |"
+                for turn_idx in range(max_turns):
+                    if turn_idx < len(sample.turn_advantages):
+                        adv = sample.turn_advantages[turn_idx]
+                        row += f" {adv:+6.3f} |"
+                    else:
+                        row += "   ---  |"
+                print(row, flush=True)
+            
+            print(f"{'─'*80}", flush=True)
         
-        print(f"{'─'*80}", flush=True)
+        print(f"{'='*80}\n", flush=True)
 
     def _print_group_details(
         self,
@@ -832,10 +850,6 @@ class AgentGRPOTrainer:
         print(f"   Rewards: mean={np.mean(rewards):.3f}, std={np.std(rewards):.3f}, "
               f"range=[{np.min(rewards):.3f}, {np.max(rewards):.3f}]", flush=True)
         print(f"   Correct answers: {correct}/{len(sorted_samples)} ({correct/len(sorted_samples)*100:.1f}%)", flush=True)
-        
-        # 打印每轮 advantage 表格
-        self._print_turn_advantage_table(sorted_samples)
-        
         print(f"{'='*80}\n", flush=True)
     
     def _print_trajectory_summary(self, sample: "TrajectorySample", query: SyntheticQuery) -> None:
@@ -1292,11 +1306,165 @@ class AgentGRPOTrainer:
                 reward_map[group.query.id].extend(rewards)
         return reward_map
     
+    def _compute_eval_statistics(
+        self,
+        groups: List[TrajectoryGroup],
+        eval_time: float,
+        step: int = -1,
+        is_baseline: bool = False,
+    ) -> Dict:
+        """Compute detailed evaluation statistics from trajectory groups.
+        
+        Args:
+            groups: List of trajectory groups
+            eval_time: Time taken for evaluation
+            step: Step number (use -1 for baseline)
+            is_baseline: Whether this is a baseline evaluation
+            
+        Returns:
+            Dictionary with all evaluation statistics
+        """
+        samples = [sample for group in groups for sample in group.samples]
+        rewards = [sample.reward for sample in samples]
+        rubrics = [sample.rubric for sample in samples]
+        correct_answers = sum(1 for r in rubrics if r.answer_correct)
+        avg_reward = np.mean(rewards) if rewards else 0.0
+        accuracy = correct_answers / max(len(rubrics), 1) if rubrics else 0.0
+        
+        # Basic statistics
+        attempted = sum(1 for r in rubrics if r.attempted_answer)
+        found_email = sum(1 for r in rubrics if r.ever_found_right_email)
+        read_email = sum(1 for r in rubrics if r.ever_read_right_email)
+        
+        # Additional detailed statistics
+        total_repeated_searches = sum(r.num_repeated_searches for r in rubrics)
+        total_unique_searches = sum(r.num_unique_searches for r in rubrics)
+        total_searches = sum(r.num_total_searches for r in rubrics)
+        
+        # Average turns for correct answers
+        correct_rubrics = [r for r in rubrics if r.answer_correct]
+        avg_turns_correct = np.mean([r.num_turns for r in correct_rubrics]) if correct_rubrics else 0.0
+        
+        # Average turns for "I don't know" responses
+        idk_rubrics = [r for r in rubrics if r.returned_i_dont_know]
+        avg_turns_idk = np.mean([r.num_turns for r in idk_rubrics]) if idk_rubrics else 0.0
+        
+        # Average search attempts per sample
+        avg_search_attempts = total_searches / max(len(rubrics), 1)
+        
+        eval_stats = {
+            "step": step,
+            "is_baseline": is_baseline,
+            "accuracy": accuracy,
+            "correct_answers": correct_answers,
+            "total_samples": len(rubrics),
+            "attempted_answer": attempted,
+            "avg_reward": avg_reward,
+            "median_reward": float(np.median(rewards)) if rewards else 0.0,
+            "std_reward": float(np.std(rewards)) if rewards else 0.0,
+            "min_reward": float(np.min(rewards)) if rewards else 0.0,
+            "max_reward": float(np.max(rewards)) if rewards else 0.0,
+            "found_correct_email": found_email,
+            "read_correct_email": read_email,
+            "total_repeated_searches": total_repeated_searches,
+            "total_unique_searches": total_unique_searches,
+            "total_searches": total_searches,
+            "avg_turns_correct": avg_turns_correct,
+            "avg_turns_idk": avg_turns_idk,
+            "avg_search_attempts": avg_search_attempts,
+            "num_idk": len(idk_rubrics),
+            "eval_time": eval_time,
+        }
+        
+        return eval_stats, {
+            "rewards": rewards,
+            "rubrics": rubrics,
+            "correct_answers": correct_answers,
+            "avg_reward": avg_reward,
+            "accuracy": accuracy,
+            "attempted": attempted,
+            "found_email": found_email,
+            "read_email": read_email,
+            "total_repeated_searches": total_repeated_searches,
+            "total_unique_searches": total_unique_searches,
+            "total_searches": total_searches,
+            "avg_turns_correct": avg_turns_correct,
+            "avg_turns_idk": avg_turns_idk,
+            "avg_search_attempts": avg_search_attempts,
+            "num_idk": len(idk_rubrics),
+        }
+
+    def _print_eval_results(
+        self,
+        stats: Dict,
+        computed: Dict,
+        eval_log_file: Path,
+        beat_rate: Optional[float] = None,
+    ):
+        """Print evaluation results to console and logger.
+        
+        Args:
+            stats: Full evaluation statistics dictionary
+            computed: Computed values for display
+            eval_log_file: Path to saved JSON file
+            beat_rate: Optional beat rate for comparison
+        """
+        # Print to console
+        print(f"\n{'='*80}", flush=True)
+        title = "📊 BASELINE EVALUATION RESULTS" if stats["is_baseline"] else "📊 EVALUATION RESULTS"
+        print(f"{title}", flush=True)
+        print(f"{'='*80}", flush=True)
+        print(f"🧩 Checkpoint: {stats['step']}", flush=True)
+        print(f"📈 Accuracy: {computed['accuracy']*100:.2f}% ({computed['correct_answers']}/{max(len(computed['rubrics']),1)})", flush=True)
+        if beat_rate is not None:
+            print(f"🤝 Beat control: {beat_rate*100:.1f}% of queries", flush=True)
+        print(f"\n⏱️  Time taken: {stats['eval_time']:.1f}s ({stats['eval_time']/max(len(computed['rubrics']),1):.2f}s per query)", flush=True)
+        if computed['rewards']:
+            print(f"💰 Average reward: {computed['avg_reward']:.3f} (std: {np.std(computed['rewards']):.3f})", flush=True)
+            print(f"   Median reward: {np.median(computed['rewards']):.3f}", flush=True)
+            print(f"   Range: [{np.min(computed['rewards']):.3f}, {np.max(computed['rewards']):.3f}]", flush=True)
+        print(f"\n📊 Detailed Rubric Statistics:", flush=True)
+        print(f"   Attempted answers: {computed['attempted']}/{len(computed['rubrics'])} ({computed['attempted']/max(len(computed['rubrics']),1)*100:.1f}%)", flush=True)
+        print(f"   Found correct email: {computed['found_email']}/{len(computed['rubrics'])} ({computed['found_email']/max(len(computed['rubrics']),1)*100:.1f}%)", flush=True)
+        print(f"   Read correct email: {computed['read_email']}/{len(computed['rubrics'])} ({computed['read_email']/max(len(computed['rubrics']),1)*100:.1f}%)", flush=True)
+        print(f"   Repeated searches: {computed['total_repeated_searches']} (total: {computed['total_searches']}, unique: {computed['total_unique_searches']})", flush=True)
+        print(f"   Avg turns (correct): {computed['avg_turns_correct']:.2f} turns", flush=True)
+        print(f"   Avg turns (I don't know): {computed['avg_turns_idk']:.2f} turns (count: {computed['num_idk']})", flush=True)
+        print(f"   Avg search attempts: {computed['avg_search_attempts']:.2f}", flush=True)
+        print(f"\n💾 Eval stats saved to: {eval_log_file}", flush=True)
+        print(f"{'='*80}\n", flush=True)
+        
+        # Log to logger
+        logger.info(f"\n{'─'*80}")
+        logger.info(title)
+        logger.info(f"{'─'*80}")
+        logger.info(f"Checkpoint: {stats['step']}")
+        logger.info(f"Accuracy: {computed['accuracy']*100:.2f}% ({computed['correct_answers']}/{max(len(computed['rubrics']),1)})")
+        logger.info(f"Time taken: {stats['eval_time']:.1f}s ({stats['eval_time']/max(len(computed['rubrics']),1):.2f}s per query)")
+        logger.info(f"Average reward: {computed['avg_reward']:.3f}")
+        if computed['rewards']:
+            logger.info(f"Median reward: {np.median(computed['rewards']):.3f}")
+            logger.info(f"Reward range: [{np.min(computed['rewards']):.3f}, {np.max(computed['rewards']):.3f}]")
+        if beat_rate is not None:
+            logger.info(f"Beat control: {beat_rate*100:.1f}%")
+        logger.info("Detailed Rubric Statistics:")
+        logger.info(f"  - Attempted answers: {computed['attempted']}/{len(computed['rubrics'])} ({computed['attempted']/max(len(computed['rubrics']),1)*100:.1f}%)")
+        logger.info(f"  - Found correct email: {computed['found_email']}/{len(computed['rubrics'])} ({computed['found_email']/max(len(computed['rubrics']),1)*100:.1f}%)")
+        logger.info(f"  - Read correct email: {computed['read_email']}/{len(computed['rubrics'])} ({computed['read_email']/max(len(computed['rubrics']),1)*100:.1f}%)")
+        logger.info(f"  - Repeated searches: {computed['total_repeated_searches']} (total: {computed['total_searches']}, unique: {computed['total_unique_searches']})")
+        logger.info(f"  - Avg turns (correct): {computed['avg_turns_correct']:.2f} turns")
+        logger.info(f"  - Avg turns (I don't know): {computed['avg_turns_idk']:.2f} turns (count: {computed['num_idk']})")
+        logger.info(f"  - Avg search attempts: {computed['avg_search_attempts']:.2f}")
+        logger.info(f"💾 Eval stats saved to: {eval_log_file}")
+        logger.info(f"{'─'*80}\n")
+
     def _ensure_control_baseline(self):
         """Collect baseline evaluation groups for beat-rate comparisons."""
         if self.control_groups is not None:
             return
         logger.info("🎯 Collecting control baseline for evaluation comparisons...")
+        baseline_start = time.time()
+        
         # Use verbose setting for control baseline too
         control_groups, _ = asyncio.run(
             self.collect_rollouts_for_batch(
@@ -1307,8 +1475,27 @@ class AgentGRPOTrainer:
                 is_evaluation=True,
             )
         )
+        baseline_time = time.time() - baseline_start
+        
         self.control_groups = control_groups
         self.control_reward_map = self._build_reward_map(control_groups)
+        
+        # Compute and save baseline statistics
+        eval_stats, computed = self._compute_eval_statistics(
+            control_groups, baseline_time, step=-1, is_baseline=True
+        )
+        
+        # Save to file with timestamp to avoid overwriting
+        eval_log_dir = self.output_dir / "eval_logs"
+        eval_log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        eval_log_file = eval_log_dir / f"baseline_eval_{timestamp}.json"
+        with open(eval_log_file, "w") as f:
+            json.dump(eval_stats, f, indent=2)
+        
+        # Print results
+        self._print_eval_results(eval_stats, computed, eval_log_file)
+        
         logger.info("✓ Control baseline collected")
     
     def _calculate_control_beat_rate(
@@ -1378,6 +1565,10 @@ class AgentGRPOTrainer:
             logger.info(f"{'─'*80}")
         
         kept_samples, filtering_info = self.compute_advantages(trajectory_groups, log_details=log_details)
+        
+        # Print turn-by-turn advantage tables for all groups (after advantages are computed)
+        if log_details:
+            self._print_all_groups_advantage_tables(trajectory_groups)
         
         if not kept_samples:
             logger.warning("⚠️  All groups filtered out! Skipping training step.")
@@ -1498,63 +1689,21 @@ class AgentGRPOTrainer:
             num_rollouts=self.eval_rollouts,
             is_evaluation=True,
         )
-        
-        samples = [sample for group in eval_groups for sample in group.samples]
-        rewards = [sample.reward for sample in samples]
-        rubrics = [sample.rubric for sample in samples]
-        correct_answers = sum(1 for r in rubrics if r.answer_correct)
-        avg_reward = np.mean(rewards) if rewards else 0.0
-        accuracy = correct_answers / max(len(rubrics), 1) if rubrics else 0.0
         eval_time = time.time() - eval_start
         
-        # Basic statistics
-        attempted = sum(1 for r in rubrics if r.attempted_answer)
-        found_email = sum(1 for r in rubrics if r.ever_found_right_email)
-        read_email = sum(1 for r in rubrics if r.ever_read_right_email)
-        
-        # Additional detailed statistics
-        total_repeated_searches = sum(r.num_repeated_searches for r in rubrics)
-        total_unique_searches = sum(r.num_unique_searches for r in rubrics)
-        total_searches = sum(r.num_total_searches for r in rubrics)
-        
-        # Average turns for correct answers
-        correct_rubrics = [r for r in rubrics if r.answer_correct]
-        avg_turns_correct = np.mean([r.num_turns for r in correct_rubrics]) if correct_rubrics else 0.0
-        
-        # Average turns for "I don't know" responses
-        idk_rubrics = [r for r in rubrics if r.returned_i_dont_know]
-        avg_turns_idk = np.mean([r.num_turns for r in idk_rubrics]) if idk_rubrics else 0.0
-        
-        # Average search attempts per sample
-        avg_search_attempts = total_searches / max(len(rubrics), 1)
+        # Compute statistics using shared method
+        eval_stats, computed = self._compute_eval_statistics(
+            eval_groups, eval_time, step=self.global_step, is_baseline=False
+        )
         
         beat_stats = self._calculate_control_beat_rate(eval_groups)
         beat_rate = beat_stats["beat_rate"] if beat_stats else None
-        
-        # Prepare detailed evaluation statistics
-        eval_stats = {
-            "step": self.global_step,
-            "accuracy": accuracy,
-            "correct_answers": correct_answers,
-            "total_samples": len(rubrics),
-            "attempted_answer": attempted,
-            "avg_reward": avg_reward,
-            "median_reward": float(np.median(rewards)) if rewards else 0.0,
-            "std_reward": float(np.std(rewards)) if rewards else 0.0,
-            "min_reward": float(np.min(rewards)) if rewards else 0.0,
-            "max_reward": float(np.max(rewards)) if rewards else 0.0,
-            "found_correct_email": found_email,
-            "read_correct_email": read_email,
-            "total_repeated_searches": total_repeated_searches,
-            "total_unique_searches": total_unique_searches,
-            "total_searches": total_searches,
-            "avg_turns_correct": avg_turns_correct,
-            "avg_turns_idk": avg_turns_idk,
-            "avg_search_attempts": avg_search_attempts,
-            "num_idk": len(idk_rubrics),
-            "eval_time": eval_time,
-            "beat_rate": beat_rate if beat_rate is not None else 0.0,
-        }
+        if beat_rate is not None:
+            eval_stats["beat_rate"] = beat_rate
+            if beat_stats:
+                eval_stats["beat_control_avg_delta"] = beat_stats.get("avg_delta", 0.0)
+        else:
+            eval_stats["beat_rate"] = 0.0
         
         # Save to file
         eval_log_dir = self.output_dir / "eval_logs"
@@ -1563,74 +1712,30 @@ class AgentGRPOTrainer:
         with open(eval_log_file, "w") as f:
             json.dump(eval_stats, f, indent=2)
         
-        if log_details:
-            print(f"\n{'='*80}", flush=True)
-            print(f"📊 EVALUATION RESULTS", flush=True)
-            print(f"{'='*80}", flush=True)
-            print(f"🧩 Checkpoint: {self.global_step}", flush=True)
-            print(f"📈 Accuracy: {accuracy*100:.2f}% ({correct_answers}/{max(len(rubrics),1)})", flush=True)
-            if beat_rate is not None:
-                print(f"🤝 Beat control: {beat_rate*100:.1f}% of queries", flush=True)
-            print(f"\n⏱️  Time taken: {eval_time:.1f}s ({eval_time/max(len(rubrics),1):.2f}s per query)", flush=True)
-            if rewards:
-                print(f"💰 Average reward: {avg_reward:.3f} (std: {np.std(rewards):.3f})", flush=True)
-                print(f"   Median reward: {np.median(rewards):.3f}", flush=True)
-                print(f"   Range: [{np.min(rewards):.3f}, {np.max(rewards):.3f}]", flush=True)
-            print(f"\n📊 Detailed Rubric Statistics:", flush=True)
-            print(f"   Attempted answers: {attempted}/{len(rubrics)} ({attempted/max(len(rubrics),1)*100:.1f}%)", flush=True)
-            print(f"   Found correct email: {found_email}/{len(rubrics)} ({found_email/max(len(rubrics),1)*100:.1f}%)", flush=True)
-            print(f"   Read correct email: {read_email}/{len(rubrics)} ({read_email/max(len(rubrics),1)*100:.1f}%)", flush=True)
-            print(f"   Repeated searches: {total_repeated_searches} (total: {total_searches}, unique: {total_unique_searches})", flush=True)
-            print(f"   Avg turns (correct): {avg_turns_correct:.2f} turns", flush=True)
-            print(f"   Avg turns (I don't know): {avg_turns_idk:.2f} turns (count: {len(idk_rubrics)})", flush=True)
-            print(f"   Avg search attempts: {avg_search_attempts:.2f}", flush=True)
-            print(f"\n💾 Eval stats saved to: {eval_log_file}", flush=True)
-            print(f"{'='*80}\n", flush=True)
-        
-        logger.info(f"\n{'─'*80}")
-        logger.info("📊 EVALUATION RESULTS")
-        logger.info(f"{'─'*80}")
-        logger.info(f"Checkpoint: {self.global_step}")
-        logger.info(f"Accuracy: {accuracy*100:.2f}% ({correct_answers}/{max(len(rubrics),1)})")
-        logger.info(f"Time taken: {eval_time:.1f}s ({eval_time/max(len(rubrics),1):.2f}s per query)")
-        logger.info(f"Average reward: {avg_reward:.3f}")
-        if rewards:
-            logger.info(f"Median reward: {np.median(rewards):.3f}")
-            logger.info(f"Reward range: [{np.min(rewards):.3f}, {np.max(rewards):.3f}]")
-        if beat_rate is not None:
-            logger.info(f"Beat control: {beat_rate*100:.1f}% (Δavg={beat_stats['avg_delta']:.3f})")
-        logger.info("Detailed Rubric Statistics:")
-        logger.info(f"  - Attempted answers: {attempted}/{len(rubrics)} ({attempted/max(len(rubrics),1)*100:.1f}%)")
-        logger.info(f"  - Found correct email: {found_email}/{len(rubrics)} ({found_email/max(len(rubrics),1)*100:.1f}%)")
-        logger.info(f"  - Read correct email: {read_email}/{len(rubrics)} ({read_email/max(len(rubrics),1)*100:.1f}%)")
-        logger.info(f"  - Repeated searches: {total_repeated_searches} (total: {total_searches}, unique: {total_unique_searches})")
-        logger.info(f"  - Avg turns (correct): {avg_turns_correct:.2f} turns")
-        logger.info(f"  - Avg turns (I don't know): {avg_turns_idk:.2f} turns (count: {len(idk_rubrics)})")
-        logger.info(f"  - Avg search attempts: {avg_search_attempts:.2f}")
-        logger.info(f"💾 Eval stats saved to: {eval_log_file}")
-        logger.info(f"{'─'*80}\n")
+        # Print results
+        self._print_eval_results(eval_stats, computed, eval_log_file, beat_rate)
         
         # Log to wandb
         if self.use_wandb:
             wandb_log = {
-                "eval/accuracy": accuracy,
-                "eval/avg_reward": avg_reward,
-                "eval/median_reward": np.median(rewards) if rewards else 0.0,
-                "eval/min_reward": np.min(rewards) if rewards else 0.0,
-                "eval/max_reward": np.max(rewards) if rewards else 0.0,
-                "eval/std_reward": np.std(rewards) if rewards else 0.0,
-                "eval/attempted_answer": attempted / max(len(rubrics), 1),
-                "eval/found_email": found_email / max(len(rubrics), 1),
-                "eval/read_email": read_email / max(len(rubrics), 1),
+                "eval/accuracy": computed["accuracy"],
+                "eval/avg_reward": computed["avg_reward"],
+                "eval/median_reward": np.median(computed["rewards"]) if computed["rewards"] else 0.0,
+                "eval/min_reward": np.min(computed["rewards"]) if computed["rewards"] else 0.0,
+                "eval/max_reward": np.max(computed["rewards"]) if computed["rewards"] else 0.0,
+                "eval/std_reward": np.std(computed["rewards"]) if computed["rewards"] else 0.0,
+                "eval/attempted_answer": computed["attempted"] / max(len(computed["rubrics"]), 1),
+                "eval/found_email": computed["found_email"] / max(len(computed["rubrics"]), 1),
+                "eval/read_email": computed["read_email"] / max(len(computed["rubrics"]), 1),
                 "eval/eval_time": eval_time,
                 "eval/step": self.global_step,
-                "eval/total_repeated_searches": total_repeated_searches,
-                "eval/total_unique_searches": total_unique_searches,
-                "eval/total_searches": total_searches,
-                "eval/avg_turns_correct": avg_turns_correct,
-                "eval/avg_turns_idk": avg_turns_idk,
-                "eval/avg_search_attempts": avg_search_attempts,
-                "eval/num_idk": len(idk_rubrics),
+                "eval/total_repeated_searches": computed["total_repeated_searches"],
+                "eval/total_unique_searches": computed["total_unique_searches"],
+                "eval/total_searches": computed["total_searches"],
+                "eval/avg_turns_correct": computed["avg_turns_correct"],
+                "eval/avg_turns_idk": computed["avg_turns_idk"],
+                "eval/avg_search_attempts": computed["avg_search_attempts"],
+                "eval/num_idk": computed["num_idk"],
             }
             if beat_rate is not None:
                 wandb_log["eval/beat_control_rate"] = beat_rate
@@ -1638,7 +1743,7 @@ class AgentGRPOTrainer:
                     wandb_log["eval/beat_control_avg_delta"] = beat_stats.get("avg_delta", 0.0)
             wandb.log(wandb_log, step=self.global_step)
         
-        return avg_reward, accuracy, beat_rate
+        return computed["avg_reward"], computed["accuracy"], beat_rate
     
     def save_model(self, path: Path, metrics: Optional[Dict] = None):
         """Save model checkpoint with full training state."""
