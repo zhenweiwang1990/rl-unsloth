@@ -187,6 +187,155 @@ class AgentGRPOTrainer:
         logger.info(f"Wandb logging: {'enabled' if self.use_wandb else 'disabled'}")
         logger.info("="*60)
     
+    def _extract_search_history(
+        self, 
+        conversation: List[Dict], 
+        current_msg_idx: int
+    ) -> List[Dict]:
+        """提取之前的所有搜索记录（包括参数和结果）.
+        
+        Args:
+            conversation: 完整的对话历史
+            current_msg_idx: 当前消息的索引
+            
+        Returns:
+            搜索历史列表，每个元素包含 keywords, from_addr, to_addr, result_count, args
+        """
+        history = []
+        
+        for i in range(2, current_msg_idx):  # 从第一个assistant消息开始
+            msg = conversation[i]
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls", []):
+                    if tc.get("function", {}).get("name") == "search_emails":
+                        try:
+                            args_str = tc.get("function", {}).get("arguments", "{}")
+                            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                            
+                            # 获取搜索结果
+                            result_count = 0
+                            if i + 1 < len(conversation) and conversation[i+1].get("role") == "tool":
+                                try:
+                                    result = json.loads(conversation[i+1].get("content", "[]"))
+                                    result_count = len(result) if isinstance(result, list) else 0
+                                except:
+                                    pass
+                            
+                            history.append({
+                                "keywords": set(args.get("keywords", [])),
+                                "from_addr": args.get("from_addr", ""),
+                                "to_addr": args.get("to_addr", ""),
+                                "result_count": result_count,
+                                "args": args,  # 保存完整参数
+                            })
+                        except:
+                            pass
+        
+        return history
+    
+    def _analyze_search_strategy(
+        self, 
+        current_args: Dict, 
+        search_history: List[Dict]
+    ) -> Dict:
+        """分析当前搜索相对于历史搜索的策略变化.
+        
+        Args:
+            current_args: 当前搜索的参数
+            search_history: 历史搜索记录
+            
+        Returns:
+            {
+                "is_exact_repeat": bool,  # 是否完全重复
+                "is_new_strategy": bool,   # 是否新策略
+                "diversity_score": float,  # 多样性得分 [0, 1]
+                "strategy_type": str,      # 策略类型描述
+            }
+        """
+        current_keywords = set(current_args.get("keywords", []))
+        current_from = current_args.get("from_addr", "")
+        current_to = current_args.get("to_addr", "")
+        
+        if not search_history:
+            # 第一次搜索
+            return {
+                "is_exact_repeat": False,
+                "is_new_strategy": True,
+                "diversity_score": 0.5,  # 中性
+                "strategy_type": "first_search",
+            }
+        
+        # 检查是否完全重复
+        for prev in search_history:
+            if (current_keywords == prev["keywords"] and 
+                current_from == prev["from_addr"] and
+                current_to == prev["to_addr"]):
+                return {
+                    "is_exact_repeat": True,
+                    "is_new_strategy": False,
+                    "diversity_score": 0.0,
+                    "strategy_type": "exact_repeat",
+                }
+        
+        # 分析策略变化类型
+        prev = search_history[-1]  # 最近的一次搜索
+        prev_keywords = prev["keywords"]
+        
+        # 计算关键词变化
+        keywords_removed = len(prev_keywords - current_keywords)
+        keywords_added = len(current_keywords - prev_keywords)
+        keywords_kept = len(current_keywords & prev_keywords)
+        
+        strategy_changes = []
+        diversity_score = 0.0
+        
+        # 1. 完全不同的关键词（探索新方向）
+        if keywords_kept == 0 and len(current_keywords) > 0:
+            strategy_changes.append("completely_different")
+            diversity_score += 1.0
+        
+        # 2. 减少关键词（放宽搜索）
+        elif keywords_removed > 0 and keywords_added == 0:
+            strategy_changes.append("broadening")
+            # 减少越多，多样性越高（但有上限）
+            diversity_score += min(keywords_removed * 0.3, 0.8)
+        
+        # 3. 替换部分关键词（调整策略）
+        elif keywords_added > 0 and keywords_removed > 0:
+            strategy_changes.append("keyword_substitution")
+            diversity_score += 0.6
+        
+        # 4. 增加关键词（细化搜索）
+        elif keywords_added > 0 and keywords_removed == 0:
+            strategy_changes.append("narrowing")
+            diversity_score += 0.3
+        
+        # 5. 改变发件人/收件人
+        if current_from != prev["from_addr"] or current_to != prev["to_addr"]:
+            strategy_changes.append("address_change")
+            diversity_score += 0.5
+        
+        # 特殊：如果上次搜索返回0结果，这次减少关键词 → 额外奖励
+        if prev["result_count"] == 0 and keywords_removed > 0:
+            diversity_score += 0.3
+        
+        # 特殊：如果多次0结果后尝试完全不同的方向 → 额外奖励
+        zero_result_count = sum(1 for h in search_history if h["result_count"] == 0)
+        if zero_result_count >= 2 and "completely_different" in strategy_changes:
+            diversity_score += 0.4
+        
+        # 限制分数范围
+        diversity_score = min(diversity_score, 1.0)
+        
+        is_new_strategy = diversity_score > 0.3
+        
+        return {
+            "is_exact_repeat": False,
+            "is_new_strategy": is_new_strategy,
+            "diversity_score": diversity_score,
+            "strategy_type": "_".join(strategy_changes) if strategy_changes else "minor_change",
+        }
+    
     def _compute_action_advantage(
         self,
         msg: Dict,
@@ -194,12 +343,15 @@ class AgentGRPOTrainer:
         query: SyntheticQuery,
         msg_idx: int,
         conversation: List[Dict],
-        trajectory_advantage: float,  # Group-level advantage作为baseline
+        trajectory_advantage: float,
     ) -> float:
-        """计算单个action的过程奖励（token-level advantage）.
+        """计算单个action的过程奖励 - 鼓励搜索策略多样化.
         
-        这个方法为每个assistant action（tool call）计算独立的优势值，
-        而不是使用统一的trajectory-level advantage。
+        核心原则：
+        1. 找到目标邮件 = 强正向奖励（无论最终答案对错）
+        2. 搜索失败但尝试新策略 = 轻微正向奖励（鼓励探索）
+        3. 搜索失败且重复策略 = 强惩罚（浪费turns）
+        4. 策略多样化（调整关键词、简化搜索）= 额外奖励
         
         Args:
             msg: 当前消息（assistant的tool call）
@@ -207,7 +359,7 @@ class AgentGRPOTrainer:
             query: 原始查询，包含ground truth
             msg_idx: 消息在conversation中的索引
             conversation: 完整的对话历史
-            trajectory_advantage: Group-level的advantage，作为baseline
+            trajectory_advantage: Group-level的advantage（仅作微调参考）
             
         Returns:
             该action的advantage值（可以是正或负）
@@ -215,86 +367,107 @@ class AgentGRPOTrainer:
         tool_calls = msg.get("tool_calls", [])
         
         if not tool_calls:
-            # 如果没有tool calls，使用trajectory-level advantage
             return trajectory_advantage
         
-        # 获取下一条消息（tool result）来判断action效果
         next_msg = conversation[msg_idx + 1] if msg_idx + 1 < len(conversation) else None
         
-        # 处理每个tool call（通常一个action只有一个tool call）
+        # 提取之前的搜索历史
+        search_history = self._extract_search_history(conversation, msg_idx)
+        
         for tc in tool_calls:
             func_name = tc.get("function", {}).get("name")
             func_args_str = tc.get("function", {}).get("arguments", "{}")
             
-            # 解析参数
             try:
                 func_args = json.loads(func_args_str) if isinstance(func_args_str, str) else func_args_str
             except:
-                # 解析错误，严重惩罚（比trajectory_advantage更负）
-                return min(trajectory_advantage - 1.5, -2.0)
+                return -2.0  # 解析错误
             
-            # === 1. 搜索动作（search_emails）===
+            # === 1. 搜索动作（核心：鼓励多样化探索）===
             if func_name == "search_emails":
-                # 检查搜索结果
                 if next_msg and next_msg.get("role") == "tool":
                     try:
                         tool_result = json.loads(next_msg.get("content", "[]"))
                         if isinstance(tool_result, list):
-                            has_reference = False
                             result_count = len(tool_result)
                             
-                            # 检查是否找到了正确的邮件
-                            for result in tool_result:
-                                if isinstance(result, dict) and result.get("message_id") == query.message_ids[0]:
-                                    has_reference = True
-                                    break
+                            # 检查是否找到目标邮件
+                            has_reference = any(
+                                isinstance(r, dict) and r.get("message_id") == query.message_ids[0]
+                                for r in tool_result
+                            )
                             
-                            # 找到了正确的邮件 → 给予正向奖励（独立于最终结果）
+                            # ✅ 找到目标邮件 → 绝对正向奖励
                             if has_reference:
-                                # 这是好的搜索！即使最终答案错了，这步也是对的
-                                return max(trajectory_advantage + 0.8, 0.3)  # 至少给0.3的正奖励
+                                return +1.2
                             
-                            # 搜索返回了结果但没找到正确邮件
-                            if result_count > 0:
-                                # 有结果但不对，轻微负面（说明搜索策略需要改进）
-                                return trajectory_advantage - 0.2
+                            # 分析搜索策略变化
+                            strategy_analysis = self._analyze_search_strategy(
+                                func_args, search_history
+                            )
+                            
+                            # 0结果的情况
+                            if result_count == 0:
+                                if strategy_analysis["is_exact_repeat"]:
+                                    # 🚫 完全重复之前0结果的搜索 → 强惩罚
+                                    return -0.8
+                                elif strategy_analysis["is_new_strategy"]:
+                                    # ✅ 尝试新策略 → 鼓励探索（即使失败）
+                                    diversity_bonus = strategy_analysis["diversity_score"] * 0.3
+                                    # 基础分：-0.1（轻微负面，因为没找到）
+                                    # 多样性奖励：最高+0.3
+                                    return max(-0.1 + diversity_bonus, -0.05)
+                                else:
+                                    # 略微调整但策略相似 → 轻微惩罚
+                                    return -0.3
+                            
+                            # 有结果但没找到目标
                             else:
-                                # 空结果，稍微负面（可能是正常的探索）
-                                return trajectory_advantage - 0.15
-                    except:
+                                if strategy_analysis["is_exact_repeat"]:
+                                    # 重复之前有结果但失败的搜索 → 惩罚
+                                    return -0.6
+                                elif strategy_analysis["is_new_strategy"]:
+                                    # 新策略找到了其他邮件 → 轻微鼓励（接近目标）
+                                    return 0.0 + strategy_analysis["diversity_score"] * 0.2
+                                else:
+                                    # 略微调整 → 中性偏负
+                                    return -0.2
+                                    
+                    except Exception as e:
+                        logger.debug(f"Error parsing search result: {e}")
                         pass
-                # 无法判断结果，使用baseline
-                return trajectory_advantage
+                
+                # 无法判断搜索结果
+                return trajectory_advantage * 0.3
             
-            # === 2. 阅读动作（read_email）===
+            # === 2. 阅读动作 ===
             elif func_name == "read_email":
                 msg_id = func_args.get("message_id", "")
-                
-                # 阅读了正确的邮件 → 给予正向奖励
                 if msg_id == query.message_ids[0]:
-                    # 这是好的阅读！即使最终答案错了，这步也是对的
-                    return max(trajectory_advantage + 0.8, 0.3)  # 至少给0.3的正奖励
+                    return +1.2  # 读对了
                 else:
-                    # 阅读了错误的邮件 → 轻微惩罚
-                    return trajectory_advantage - 0.25
+                    return -0.4  # 读错了
             
-            # === 3. 最终答案（return_final_answer）===
+            # === 3. 最终答案 ===
             elif func_name == "return_final_answer":
-                # 这是最关键的action，直接使用rubric判断
                 if rubric.answer_correct:
-                    # 正确答案 → 强正向奖励
-                    return max(trajectory_advantage + 1.5, 1.0)  # 至少给1.0的强正奖励
+                    return +2.0  # 答对了
+                elif rubric.returned_i_dont_know:
+                    # "I don't know"的惩罚取决于是否做了足够探索
+                    if rubric.num_unique_searches >= 3:
+                        # 尝试了多种策略后放弃 → 可接受
+                        return -0.3
+                    else:
+                        # 探索不足就放弃 → 惩罚
+                        return -1.0
                 else:
-                    # 错误答案 → 强负向惩罚
-                    return min(trajectory_advantage - 1.5, -0.8)  # 至少给-0.8的惩罚
+                    return -1.2  # 答错了
             
-            # === 4. 错误的工具名称 ===
-            elif func_name not in ["search_emails", "read_email", "return_final_answer"]:
-                # 调用了不存在的工具 → 严重惩罚
-                return min(trajectory_advantage - 1.2, -1.5)
+            # === 4. 错误工具 ===
+            else:
+                return -2.0
         
-        # 默认：使用trajectory-level advantage
-        return trajectory_advantage
+        return trajectory_advantage * 0.5
     
     def tokenize_conversation_with_mask(
         self,
