@@ -69,6 +69,35 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 
+def patch_qwen3_gradient_checkpointing(model):
+    """Ensure Qwen3 decoder layers expose `_gradient_checkpointing_func`."""
+    import torch.utils.checkpoint
+
+    checkpoint_fn = torch.utils.checkpoint.checkpoint
+    candidate_layer_lists = []
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        candidate_layer_lists.append(model.model.layers)
+    if (
+        hasattr(model, "base_model")
+        and hasattr(model.base_model, "model")
+        and hasattr(model.base_model.model, "layers")
+    ):
+        candidate_layer_lists.append(model.base_model.model.layers)
+
+    patched = 0
+    for layers in candidate_layer_lists:
+        if not layers:
+            continue
+        for layer in layers:
+            if not hasattr(layer, "_gradient_checkpointing_func"):
+                layer._gradient_checkpointing_func = checkpoint_fn
+                patched += 1
+        if patched:
+            break
+    return patched
+
+
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(description="GRPO Training for Email Agent")
@@ -249,11 +278,42 @@ def main():
             dtype=None,
         )
         
-        # Load LoRA adapter from checkpoint
-        print(f"Loading LoRA adapter from checkpoint: {resume_from_checkpoint}", flush=True)
-        logger.info(f"Loading LoRA adapter from checkpoint: {resume_from_checkpoint}")
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, str(resume_from_checkpoint))
+        # Apply LoRA configuration
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=config.lora_r,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=config.seed,
+            max_seq_length=config.max_seq_length,
+        )
+        
+        # Load LoRA weights from checkpoint
+        print(f"Loading LoRA weights from checkpoint: {resume_from_checkpoint}", flush=True)
+        logger.info(f"Loading LoRA weights from checkpoint: {resume_from_checkpoint}")
+        from peft import set_peft_model_state_dict
+        from pathlib import Path
+        
+        # Try safetensors first, fallback to bin format
+        checkpoint_path = Path(resume_from_checkpoint)
+        safetensors_path = checkpoint_path / "adapter_model.safetensors"
+        bin_path = checkpoint_path / "adapter_model.bin"
+        
+        if safetensors_path.exists():
+            from safetensors.torch import load_file
+            adapter_weights = load_file(str(safetensors_path))
+        elif bin_path.exists():
+            adapter_weights = torch.load(str(bin_path), map_location="cpu")
+        else:
+            raise FileNotFoundError(f"No adapter weights found in {resume_from_checkpoint}")
+        
+        set_peft_model_state_dict(model, adapter_weights)
         print("✓ Base model and LoRA adapter loaded", flush=True)
         logger.info("✓ Base model and LoRA adapter loaded")
     else:
@@ -278,10 +338,18 @@ def main():
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             bias="none",
-            use_gradient_checkpointing=True,  # Fallback to standard checkpointing as "unsloth" has issues with Qwen3
+            use_gradient_checkpointing="unsloth",
             random_state=config.seed,
             max_seq_length=config.max_seq_length,
         )
+
+    patched_layers = patch_qwen3_gradient_checkpointing(model)
+    if patched_layers:
+        print(f"🩹 Patched {patched_layers} Qwen3 decoder layers for gradient checkpointing", flush=True)
+        logger.info(f"Patched {patched_layers} Qwen3 decoder layers for gradient checkpointing")
+    else:
+        print("⚠️ Could not find Qwen3 decoder layers to patch for gradient checkpointing", flush=True)
+        logger.warning("Could not find Qwen3 decoder layers to patch for gradient checkpointing")
     
     # Configure tokenizer
     if tokenizer.pad_token is None:
@@ -334,13 +402,13 @@ def main():
             beta=config.beta,
             batch_size=config.per_device_train_batch_size,  # 8 questions per batch = 48 trajectories total
             gradient_accumulation_steps=get_env_int("GRADIENT_ACCUMULATION_STEPS", "1"),
-            max_grad_norm=1.0,
+            max_grad_norm=get_env_float("MAX_GRAD_NORM", "1.0"),
             output_dir=config.output_dir,
-            target_accuracy=0.95,
-            eval_steps=10,  # Evaluate every 2 steps
-            save_steps=10,
+            target_accuracy=get_env_float("TARGET_ACCURACY", "0.95"),
+            eval_steps=get_env_int("EVAL_STEPS", "10"),
+            save_steps=get_env_int("SAVE_STEPS", "10"),
             max_steps=config.max_steps,
-            warmup_steps=10,
+            warmup_steps=get_env_int("WARMUP_STEPS", "10"),
             patience=get_env_int("PATIENCE", "5"),  # Early stopping patience
             min_group_std=get_env_float("MIN_GROUP_STD", "0.05"),  # Minimum std to keep a group
             resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None,
@@ -368,7 +436,7 @@ def main():
         training_args = TRLGRPOConfig(
             output_dir=config.output_dir,
             run_name=f"email_agent_grpo_{args.mode}",
-            num_train_epochs=2,
+            num_train_epochs=get_env_int("NUM_TRAIN_EPOCHS", "2"),
             per_device_train_batch_size=config.per_device_train_batch_size,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             learning_rate=config.learning_rate,
@@ -378,13 +446,13 @@ def main():
             eval_strategy="steps",
             eval_steps=config.eval_steps,
             save_steps=config.save_steps,
-            save_total_limit=3,
+            save_total_limit=get_env_int("SAVE_TOTAL_LIMIT", "3"),
             seed=config.seed,
             bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
             optim="adamw_8bit",
             num_generation_per_prompt=config.num_generations,
             max_new_tokens=config.max_tokens,
-            temperature=0.7,
+            temperature=get_env_float("TEMPERATURE", "0.7"),
             report_to="wandb" if wandb_mode != "disabled" else None,
         )
         
@@ -410,7 +478,7 @@ def main():
             )
         
         accuracy_callback = AccuracyStopCallback(
-            target_accuracy=0.95,
+            target_accuracy=get_env_float("TARGET_ACCURACY", "0.95"),
             output_dir=config.output_dir,
             reward_tracker=reward_tracker,
         )
