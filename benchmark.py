@@ -127,7 +127,7 @@ async def benchmark_model(
     
     # Get base model name from environment
     base_model_name = os.environ.get("MODEL_NAME", "OpenPipe/Qwen3-14B-Instruct")
-    max_seq_length = get_env_int("MAX_SEQ_LENGTH", "8192")
+    max_seq_length = get_env_int("MAX_SEQ_LENGTH", "32768")
             
     # Load model with unsloth optimization
     if model_path:

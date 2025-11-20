@@ -44,7 +44,8 @@ class TrajectorySample:
     rubric: EvaluationRubric
     rollout_idx: int
     group_id: int
-    advantage: Optional[float] = None  # 保留用于group-level计算
+    advantage: Optional[float] = None  # Group-level advantage for training
+    turn_advantages: Optional[List[float]] = None  # Per-turn advantages (for detailed logging)
 
 
 @dataclass
@@ -728,6 +729,78 @@ class AgentGRPOTrainer:
         
         return list(groups_dict.values()), stats
     
+    def _compute_turn_advantages(
+        self,
+        sample: TrajectorySample,
+        trajectory_advantage: float,
+    ) -> List[float]:
+        """计算每一轮的 advantage 值（用于详细日志展示）。
+        
+        Args:
+            sample: Trajectory sample
+            trajectory_advantage: Group-level advantage baseline
+            
+        Returns:
+            List of advantages for each turn
+        """
+        turn_advantages = []
+        conversation = sample.conversation
+        rubric = sample.rubric
+        query = sample.query
+        
+        # 遍历对话，找到所有 assistant 的 turn
+        for msg_idx, msg in enumerate(conversation):
+            role = msg.get("role", "")
+            if role == "assistant":
+                # 计算这个 turn 的 advantage
+                action_advantage = self._compute_action_advantage(
+                    msg, rubric, query, msg_idx, conversation, trajectory_advantage
+                )
+                turn_advantages.append(action_advantage)
+        
+        return turn_advantages
+
+    def _print_turn_advantage_table(
+        self,
+        sorted_samples: List["TrajectorySample"],
+    ) -> None:
+        """打印每个 rollout 的每轮 advantage 变化表格。
+        
+        Args:
+            sorted_samples: Sorted list of trajectory samples
+        """
+        # 找出最大 turn 数
+        max_turns = max((s.rubric.num_turns for s in sorted_samples), default=0)
+        if max_turns == 0:
+            return
+        
+        print(f"\n{'─'*80}", flush=True)
+        print(f"📊 Turn-by-Turn Advantage Table:", flush=True)
+        print(f"{'─'*80}", flush=True)
+        
+        # 打印表头
+        header = "Rollout |"
+        for turn in range(1, max_turns + 1):
+            header += f" Turn {turn:2d} |"
+        print(header, flush=True)
+        print("─" * len(header), flush=True)
+        
+        # 打印每个 rollout 的 advantage
+        for sample in sorted_samples:
+            if sample.turn_advantages is None:
+                continue
+            
+            row = f"   {sample.rollout_idx + 1:2d}  |"
+            for turn_idx in range(max_turns):
+                if turn_idx < len(sample.turn_advantages):
+                    adv = sample.turn_advantages[turn_idx]
+                    row += f" {adv:+6.3f} |"
+                else:
+                    row += "   ---  |"
+            print(row, flush=True)
+        
+        print(f"{'─'*80}", flush=True)
+
     def _print_group_details(
         self,
         query: SyntheticQuery,
@@ -759,6 +832,10 @@ class AgentGRPOTrainer:
         print(f"   Rewards: mean={np.mean(rewards):.3f}, std={np.std(rewards):.3f}, "
               f"range=[{np.min(rewards):.3f}, {np.max(rewards):.3f}]", flush=True)
         print(f"   Correct answers: {correct}/{len(sorted_samples)} ({correct/len(sorted_samples)*100:.1f}%)", flush=True)
+        
+        # 打印每轮 advantage 表格
+        self._print_turn_advantage_table(sorted_samples)
+        
         print(f"{'='*80}\n", flush=True)
     
     def _print_trajectory_summary(self, sample: "TrajectorySample", query: SyntheticQuery) -> None:
@@ -955,6 +1032,8 @@ class AgentGRPOTrainer:
             
             for sample, advantage in zip(group.samples, group_advantages):
                 sample.advantage = float(advantage)
+                # 计算每轮的 advantage（用于详细日志）
+                sample.turn_advantages = self._compute_turn_advantages(sample, float(advantage))
                 kept_samples.append(sample)
             
             if log_details:
@@ -978,7 +1057,7 @@ class AgentGRPOTrainer:
     def _tokenize_samples(self, samples: List[TrajectorySample]) -> List[TokenizedTrajectory]:
         """Tokenize trajectories and enforce max sequence length with process-based advantages."""
         tokenized: List[TokenizedTrajectory] = []
-        max_len = self.max_seq_length or 8192
+        max_len = self.max_seq_length or 32768
         
         for sample in samples:
             if sample.advantage is None:
@@ -1073,7 +1152,7 @@ class AgentGRPOTrainer:
         
         pad_id = self.pad_token_id
         max_seq = min(
-            self.max_seq_length or 8192,
+            self.max_seq_length or 32768,
             max(sample.input_ids.size(0) for sample in tokenized_samples),
         )
         
@@ -1359,13 +1438,31 @@ class AgentGRPOTrainer:
         self.optimizer.zero_grad()
         training_time = time.time() - training_start
         
+        # Count rollouts that exited early (didn't exhaust max_turns)
+        num_early_exit = sum(1 for r in rubrics if not r.ran_out_of_turns and r.attempted_answer)
+        
         if log_details:
             logger.info(f"✓ Grad norm (clipped): {grad_norm:.4f}")
             logger.info(f"✓ Tokens trained: {loss_metrics['trainable_tokens']}")
             logger.info(f"✓ Total loss: {total_loss.item():.4f}")
+            logger.info(f"\n📊 Group Summary:")
+            logger.info(f"  - Total groups: {len(trajectory_groups)}")
+            logger.info(f"  - Groups kept for training: {filtering_info['groups_kept']}")
+            logger.info(f"  - Groups filtered (low variance): {filtering_info['groups_filtered']}")
+            logger.info(f"  - Rollouts that finished early (didn't exhaust turns): {num_early_exit}/{len(all_samples)}")
+            logger.info(f"  - Total rollout time: {rollout_time:.1f}s")
+            logger.info(f"  - Total training time: {training_time:.1f}s")
+            logger.info(f"  - Total tokens: {loss_metrics['total_tokens']:,}")
+            logger.info(f"  - Trainable tokens: {loss_metrics['trainable_tokens']:,} ({loss_metrics['trainable_tokens']/max(loss_metrics['total_tokens'],1)*100:.1f}%)")
             logger.info(f"{'─'*80}\n")
         
         accuracy = (sum(1 for r in rubrics if r.answer_correct) / max(len(rubrics), 1)) if rubrics else 0.0
+        
+        # Also output a concise summary in non-verbose mode
+        if not log_details:
+            logger.info(f"  Groups: {filtering_info['groups_kept']}/{len(trajectory_groups)} kept "
+                       f"({filtering_info['groups_filtered']} filtered), "
+                       f"{num_early_exit}/{len(all_samples)} finished early")
         
         metrics = TrainingMetrics(
             loss=total_loss.item(),
@@ -1381,6 +1478,9 @@ class AgentGRPOTrainer:
             training_time=training_time,
             reward_std=np.std(rewards) if rewards else 0.0,
             median_reward=np.median(rewards) if rewards else 0.0,
+            groups_kept=filtering_info["groups_kept"],
+            groups_filtered=filtering_info["groups_filtered"],
+            num_early_exit=num_early_exit,
         )
         
         return metrics
@@ -1407,12 +1507,61 @@ class AgentGRPOTrainer:
         accuracy = correct_answers / max(len(rubrics), 1) if rubrics else 0.0
         eval_time = time.time() - eval_start
         
+        # Basic statistics
         attempted = sum(1 for r in rubrics if r.attempted_answer)
         found_email = sum(1 for r in rubrics if r.ever_found_right_email)
         read_email = sum(1 for r in rubrics if r.ever_read_right_email)
         
+        # Additional detailed statistics
+        total_repeated_searches = sum(r.num_repeated_searches for r in rubrics)
+        total_unique_searches = sum(r.num_unique_searches for r in rubrics)
+        total_searches = sum(r.num_total_searches for r in rubrics)
+        
+        # Average turns for correct answers
+        correct_rubrics = [r for r in rubrics if r.answer_correct]
+        avg_turns_correct = np.mean([r.num_turns for r in correct_rubrics]) if correct_rubrics else 0.0
+        
+        # Average turns for "I don't know" responses
+        idk_rubrics = [r for r in rubrics if r.returned_i_dont_know]
+        avg_turns_idk = np.mean([r.num_turns for r in idk_rubrics]) if idk_rubrics else 0.0
+        
+        # Average search attempts per sample
+        avg_search_attempts = total_searches / max(len(rubrics), 1)
+        
         beat_stats = self._calculate_control_beat_rate(eval_groups)
         beat_rate = beat_stats["beat_rate"] if beat_stats else None
+        
+        # Prepare detailed evaluation statistics
+        eval_stats = {
+            "step": self.global_step,
+            "accuracy": accuracy,
+            "correct_answers": correct_answers,
+            "total_samples": len(rubrics),
+            "attempted_answer": attempted,
+            "avg_reward": avg_reward,
+            "median_reward": float(np.median(rewards)) if rewards else 0.0,
+            "std_reward": float(np.std(rewards)) if rewards else 0.0,
+            "min_reward": float(np.min(rewards)) if rewards else 0.0,
+            "max_reward": float(np.max(rewards)) if rewards else 0.0,
+            "found_correct_email": found_email,
+            "read_correct_email": read_email,
+            "total_repeated_searches": total_repeated_searches,
+            "total_unique_searches": total_unique_searches,
+            "total_searches": total_searches,
+            "avg_turns_correct": avg_turns_correct,
+            "avg_turns_idk": avg_turns_idk,
+            "avg_search_attempts": avg_search_attempts,
+            "num_idk": len(idk_rubrics),
+            "eval_time": eval_time,
+            "beat_rate": beat_rate if beat_rate is not None else 0.0,
+        }
+        
+        # Save to file
+        eval_log_dir = self.output_dir / "eval_logs"
+        eval_log_dir.mkdir(parents=True, exist_ok=True)
+        eval_log_file = eval_log_dir / f"eval_step_{self.global_step:04d}.json"
+        with open(eval_log_file, "w") as f:
+            json.dump(eval_stats, f, indent=2)
         
         if log_details:
             print(f"\n{'='*80}", flush=True)
@@ -1427,10 +1576,15 @@ class AgentGRPOTrainer:
                 print(f"💰 Average reward: {avg_reward:.3f} (std: {np.std(rewards):.3f})", flush=True)
                 print(f"   Median reward: {np.median(rewards):.3f}", flush=True)
                 print(f"   Range: [{np.min(rewards):.3f}, {np.max(rewards):.3f}]", flush=True)
-            print(f"\n📊 Rubric Statistics:", flush=True)
-            print(f"   Attempted answer: {attempted}/{len(rubrics)} ({attempted/max(len(rubrics),1)*100:.1f}%)", flush=True)
+            print(f"\n📊 Detailed Rubric Statistics:", flush=True)
+            print(f"   Attempted answers: {attempted}/{len(rubrics)} ({attempted/max(len(rubrics),1)*100:.1f}%)", flush=True)
             print(f"   Found correct email: {found_email}/{len(rubrics)} ({found_email/max(len(rubrics),1)*100:.1f}%)", flush=True)
             print(f"   Read correct email: {read_email}/{len(rubrics)} ({read_email/max(len(rubrics),1)*100:.1f}%)", flush=True)
+            print(f"   Repeated searches: {total_repeated_searches} (total: {total_searches}, unique: {total_unique_searches})", flush=True)
+            print(f"   Avg turns (correct): {avg_turns_correct:.2f} turns", flush=True)
+            print(f"   Avg turns (I don't know): {avg_turns_idk:.2f} turns (count: {len(idk_rubrics)})", flush=True)
+            print(f"   Avg search attempts: {avg_search_attempts:.2f}", flush=True)
+            print(f"\n💾 Eval stats saved to: {eval_log_file}", flush=True)
             print(f"{'='*80}\n", flush=True)
         
         logger.info(f"\n{'─'*80}")
@@ -1445,10 +1599,15 @@ class AgentGRPOTrainer:
             logger.info(f"Reward range: [{np.min(rewards):.3f}, {np.max(rewards):.3f}]")
         if beat_rate is not None:
             logger.info(f"Beat control: {beat_rate*100:.1f}% (Δavg={beat_stats['avg_delta']:.3f})")
-        logger.info("Rubric Statistics:")
-        logger.info(f"  - Attempted answer: {attempted}/{len(rubrics)}")
-        logger.info(f"  - Found correct email: {found_email}/{len(rubrics)}")
-        logger.info(f"  - Read correct email: {read_email}/{len(rubrics)}")
+        logger.info("Detailed Rubric Statistics:")
+        logger.info(f"  - Attempted answers: {attempted}/{len(rubrics)} ({attempted/max(len(rubrics),1)*100:.1f}%)")
+        logger.info(f"  - Found correct email: {found_email}/{len(rubrics)} ({found_email/max(len(rubrics),1)*100:.1f}%)")
+        logger.info(f"  - Read correct email: {read_email}/{len(rubrics)} ({read_email/max(len(rubrics),1)*100:.1f}%)")
+        logger.info(f"  - Repeated searches: {total_repeated_searches} (total: {total_searches}, unique: {total_unique_searches})")
+        logger.info(f"  - Avg turns (correct): {avg_turns_correct:.2f} turns")
+        logger.info(f"  - Avg turns (I don't know): {avg_turns_idk:.2f} turns (count: {len(idk_rubrics)})")
+        logger.info(f"  - Avg search attempts: {avg_search_attempts:.2f}")
+        logger.info(f"💾 Eval stats saved to: {eval_log_file}")
         logger.info(f"{'─'*80}\n")
         
         # Log to wandb
@@ -1465,6 +1624,13 @@ class AgentGRPOTrainer:
                 "eval/read_email": read_email / max(len(rubrics), 1),
                 "eval/eval_time": eval_time,
                 "eval/step": self.global_step,
+                "eval/total_repeated_searches": total_repeated_searches,
+                "eval/total_unique_searches": total_unique_searches,
+                "eval/total_searches": total_searches,
+                "eval/avg_turns_correct": avg_turns_correct,
+                "eval/avg_turns_idk": avg_turns_idk,
+                "eval/avg_search_attempts": avg_search_attempts,
+                "eval/num_idk": len(idk_rubrics),
             }
             if beat_rate is not None:
                 wandb_log["eval/beat_control_rate"] = beat_rate
@@ -1672,6 +1838,9 @@ class AgentGRPOTrainer:
                     "train/best_accuracy": self.best_accuracy,
                     "train/eta_seconds": eta_seconds,
                     "train/progress": step / self.max_steps,
+                    "train/groups_kept": metrics.groups_kept,
+                    "train/groups_filtered": metrics.groups_filtered,
+                    "train/num_early_exit": metrics.num_early_exit,
                 }, step=step)
             
             # Evaluate

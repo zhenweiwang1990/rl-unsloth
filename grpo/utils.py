@@ -41,6 +41,9 @@ class TrainingMetrics:
     training_time: float = 0.0
     reward_std: float = 0.0
     median_reward: float = 0.0
+    groups_kept: int = 0
+    groups_filtered: int = 0
+    num_early_exit: int = 0  # Rollouts that finished without exhausting turns
 
 
 def prepare_dataset(queries: List[SyntheticQuery]) -> Dataset:
