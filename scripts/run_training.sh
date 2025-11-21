@@ -88,7 +88,7 @@ echo "💡 Tip: You can change modes with:"
 echo "   ./scripts/run_training.sh simple|rollout|masked"
 echo ""
 
-docker run --rm -it \
+docker run -d -it \
     $GPU_FLAGS \
     $ENV_FILE \
     -v $(pwd)/data:/workspace/data \
@@ -101,16 +101,3 @@ docker run --rm -it \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
     python train_grpo.py --mode $MODE --resume_best
-
-echo ""
-echo "=========================================="
-echo "Training Complete!"
-echo "=========================================="
-echo "Mode: $MODE"
-echo "Checkpoints saved to: $(pwd)/outputs/grpo_$MODE"
-echo ""
-echo "To use a different mode, run:"
-echo "  ./scripts/run_training.sh simple   # Fast testing"
-echo "  ./scripts/run_training.sh rollout  # Real rollouts"
-echo "  ./scripts/run_training.sh masked   # Token masking (default)"
-echo ""

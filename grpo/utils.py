@@ -109,6 +109,7 @@ def find_best_checkpoint(output_dir: str) -> Optional[Tuple[Path, float]]:
     
     best_checkpoint = None
     best_accuracy = -1.0
+    found_valid_accuracy = False
     
     for step, ckpt_path in checkpoints:
         metadata_file = ckpt_path / "training_metadata.json"
@@ -116,16 +117,83 @@ def find_best_checkpoint(output_dir: str) -> Optional[Tuple[Path, float]]:
             try:
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
-                accuracy = metadata.get("accuracy", 0.0)
-                if accuracy > best_accuracy:
-                    best_accuracy = accuracy
-                    best_checkpoint = ckpt_path
+                # Check if accuracy exists in metadata (not just default 0.0)
+                if "accuracy" in metadata:
+                    accuracy = metadata["accuracy"]
+                    found_valid_accuracy = True
+                    if accuracy > best_accuracy:
+                        best_accuracy = accuracy
+                        best_checkpoint = ckpt_path
+                # Also check in nested metrics dict
+                elif "metrics" in metadata and "accuracy" in metadata["metrics"]:
+                    accuracy = metadata["metrics"]["accuracy"]
+                    found_valid_accuracy = True
+                    if accuracy > best_accuracy:
+                        best_accuracy = accuracy
+                        best_checkpoint = ckpt_path
             except (json.JSONDecodeError, KeyError):
                 continue
     
-    # If no metadata found, return latest checkpoint
-    if best_checkpoint is None and checkpoints:
+    # If no valid accuracy found, return latest checkpoint
+    if not found_valid_accuracy and checkpoints:
         return checkpoints[-1][1], 0.0
     
     return (best_checkpoint, best_accuracy) if best_checkpoint else None
+
+
+def find_checkpoint_with_best_marker(output_dir: str) -> Optional[Path]:
+    """Find checkpoint that has best_model_path marker in training_state.json.
+    
+    This finds checkpoints that were marked as the best model during training.
+    If multiple checkpoints have the marker, returns the one with highest step.
+    
+    Returns:
+        Path to checkpoint with best marker, or None if no such checkpoint found.
+    """
+    checkpoints = find_checkpoints(output_dir)
+    if not checkpoints:
+        return None
+    
+    # Check all checkpoints, find ones with best_model_path marker
+    marked_checkpoints = []
+    for step, ckpt_path in checkpoints:
+        state_file = ckpt_path / "training_state.json"
+        if state_file.exists():
+            try:
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                best_model_path = state.get("best_model_path")
+                if best_model_path and best_model_path != "None":
+                    # This checkpoint has a best model marker
+                    marked_checkpoints.append((step, ckpt_path))
+            except (json.JSONDecodeError, KeyError):
+                continue
+    
+    # Return the one with highest step if any found
+    if marked_checkpoints:
+        # Sort by step and return the latest one with marker
+        marked_checkpoints.sort(key=lambda x: x[0])
+        return marked_checkpoints[-1][1]
+    
+    return None
+
+
+def find_auto_resume_checkpoint(output_dir: str) -> Optional[Path]:
+    """Automatically find checkpoint to resume from.
+    
+    Priority:
+    1. Checkpoint with best_model_path marker (if exists)
+    2. Latest checkpoint (if exists)
+    3. None (start from scratch)
+    
+    Returns:
+        Path to checkpoint to resume from, or None if no checkpoints found.
+    """
+    # First, try to find checkpoint with best marker
+    best_marked = find_checkpoint_with_best_marker(output_dir)
+    if best_marked:
+        return best_marked
+    
+    # Otherwise, use latest checkpoint
+    return find_latest_checkpoint(output_dir)
 

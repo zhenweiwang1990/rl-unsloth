@@ -9,7 +9,7 @@ class GRPOConfig(BaseModel):
     
     # Model settings
     model_name: str = "OpenPipe/Qwen3-14B-Instruct"
-    max_seq_length: int = 32768
+    max_seq_length: int = 16384
     load_in_4bit: bool = True
     
     # LoRA settings

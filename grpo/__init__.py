@@ -11,6 +11,8 @@ from grpo.utils import (
     find_checkpoints,
     find_latest_checkpoint,
     find_best_checkpoint,
+    find_checkpoint_with_best_marker,
+    find_auto_resume_checkpoint,
 )
 
 __all__ = [
@@ -25,5 +27,7 @@ __all__ = [
     "find_checkpoints",
     "find_latest_checkpoint",
     "find_best_checkpoint",
+    "find_checkpoint_with_best_marker",
+    "find_auto_resume_checkpoint",
 ]
 

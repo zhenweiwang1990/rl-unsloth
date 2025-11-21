@@ -44,6 +44,7 @@
 | `SAVE_TOTAL_LIMIT` | `3` | 保留的最大检查点数量 |
 | `TARGET_ACCURACY` | `0.95` | 提前停止的目标准确率（0.0 - 1.0） |
 | `PATIENCE` | `5` | 提前停止的耐心值（无改进的评估次数） |
+| `RUN_BASELINE_EVAL` | `true` | 是否运行 baseline 评估（设为 `false` 时从已有 JSON 加载） |
 
 ## Agent 配置
 
@@ -143,4 +144,11 @@ docker run --rm -it \
 4. **早停机制**：
    - 当验证准确率达到 `TARGET_ACCURACY` 时训练会自动停止
    - `PATIENCE` 参数控制在准确率不再提升后继续训练的评估次数
+
+5. **Baseline 评估**：
+   - 设置 `RUN_BASELINE_EVAL=false` 可以跳过 baseline 评估，从已有 JSON 文件中加载统计数据
+   - 这对于恢复训练或节省时间很有用
+   - 新版本的 baseline JSON 包含 `control_reward_map`，支持完整的 beat-rate 比较功能
+   - 旧版本的 JSON（不含 reward map）仍然可以加载，但 beat-rate 比较功能将不可用
+   - 详细格式说明请参考 `BASELINE_EVAL_FORMAT.md`
 

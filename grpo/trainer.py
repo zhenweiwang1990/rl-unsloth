@@ -105,6 +105,7 @@ class AgentGRPOTrainer:
         eval_rollouts: int = 1,
         max_seq_length: Optional[int] = None,
         use_wandb: bool = False,
+        run_baseline_eval: bool = True,  # Whether to run baseline eval or load from JSON
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -135,6 +136,7 @@ class AgentGRPOTrainer:
         )
         self.pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
         self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.run_baseline_eval = run_baseline_eval
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -165,6 +167,7 @@ class AgentGRPOTrainer:
         self.evals_without_improvement = 0  # For early stopping
         self.control_groups: Optional[List[TrajectoryGroup]] = None
         self.control_reward_map: Dict[str, List[float]] = {}
+        self.baseline_stats: Optional[Dict] = None  # For loaded baseline stats from JSON
         
         # Resume from checkpoint if provided
         if resume_from_checkpoint:
@@ -1244,7 +1247,7 @@ class AgentGRPOTrainer:
     def _tokenize_samples(self, samples: List[TrajectorySample]) -> List[TokenizedTrajectory]:
         """Tokenize trajectories and enforce max sequence length with process-based advantages."""
         tokenized: List[TokenizedTrajectory] = []
-        max_len = self.max_seq_length or 32768
+        max_len = self.max_seq_length or 16384
         
         for sample in samples:
             if sample.advantage is None:
@@ -1339,7 +1342,7 @@ class AgentGRPOTrainer:
         
         pad_id = self.pad_token_id
         max_seq = min(
-            self.max_seq_length or 32768,
+            self.max_seq_length or 16384,
             max(sample.input_ids.size(0) for sample in tokenized_samples),
         )
         
@@ -1631,10 +1634,100 @@ class AgentGRPOTrainer:
         logger.info(f"💾 Eval stats saved to: {eval_log_file}")
         logger.info(f"{'─'*80}\n")
 
+    def _find_latest_baseline_eval(self) -> Optional[Path]:
+        """Find the most recent baseline eval JSON file."""
+        eval_log_dir = self.output_dir / "eval_logs"
+        if not eval_log_dir.exists():
+            return None
+        
+        # Find all baseline eval JSON files
+        baseline_files = list(eval_log_dir.glob("baseline_eval_*.json"))
+        if not baseline_files:
+            return None
+        
+        # Sort by modification time (most recent first)
+        baseline_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return baseline_files[0]
+    
+    def _load_baseline_from_json(self, json_path: Path) -> bool:
+        """Load baseline statistics from a JSON file.
+        
+        Args:
+            json_path: Path to baseline eval JSON file
+            
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        try:
+            with open(json_path, "r") as f:
+                eval_stats = json.load(f)
+            
+            # Verify it's a baseline eval
+            if not eval_stats.get("is_baseline", False):
+                logger.warning(f"File {json_path} is not a baseline eval")
+                return False
+            
+            # Store baseline stats for reference
+            self.baseline_stats = eval_stats
+            
+            # Load control_reward_map if available
+            has_reward_map = False
+            if "control_reward_map" in eval_stats:
+                self.control_reward_map = {
+                    query_id: rewards 
+                    for query_id, rewards in eval_stats["control_reward_map"].items()
+                }
+                has_reward_map = True
+                logger.info(f"✓ Loaded reward map with {len(self.control_reward_map)} queries")
+            
+            # Print loaded baseline info
+            print(f"\n{'='*80}", flush=True)
+            print(f"📂 LOADED BASELINE EVALUATION FROM JSON", flush=True)
+            print(f"{'='*80}", flush=True)
+            print(f"📄 File: {json_path}", flush=True)
+            print(f"📈 Accuracy: {eval_stats['accuracy']*100:.2f}% ({eval_stats['correct_answers']}/{eval_stats['total_samples']})", flush=True)
+            print(f"🎁 Avg reward: {eval_stats['avg_reward']:.3f}", flush=True)
+            print(f"⏱️  Eval time: {eval_stats['eval_time']:.2f}s", flush=True)
+            
+            if has_reward_map:
+                print(f"✅ Reward map loaded: beat-rate comparison available", flush=True)
+            else:
+                print(f"⚠️  No reward map found: beat-rate comparison unavailable", flush=True)
+            
+            print(f"{'='*80}\n", flush=True)
+            
+            logger.info(f"✓ Loaded baseline from {json_path}")
+            logger.info(f"  - Accuracy: {eval_stats['accuracy']*100:.2f}%")
+            logger.info(f"  - Avg reward: {eval_stats['avg_reward']:.3f}")
+            
+            if not has_reward_map:
+                logger.info("⚠️  Note: Beat-rate comparison will not be available (reward map not found in JSON)")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load baseline from {json_path}: {e}")
+            return False
+    
     def _ensure_control_baseline(self):
-        """Collect baseline evaluation groups for beat-rate comparisons."""
-        if self.control_groups is not None:
+        """Collect baseline evaluation groups for beat-rate comparisons, or load from JSON."""
+        # Check if baseline is already loaded (either from running eval or from JSON)
+        if self.control_groups is not None or (self.control_reward_map and self.baseline_stats is not None):
             return
+        
+        # Check if we should run baseline eval or load from JSON
+        if not self.run_baseline_eval:
+            logger.info("🔍 Skipping baseline eval run, looking for existing JSON...")
+            latest_baseline = self._find_latest_baseline_eval()
+            
+            if latest_baseline:
+                if self._load_baseline_from_json(latest_baseline):
+                    return
+                else:
+                    logger.warning("Failed to load baseline from JSON, will run new baseline eval")
+            else:
+                logger.warning("No existing baseline eval JSON found, will run new baseline eval")
+        
+        # Run baseline eval (either requested or no JSON available)
         logger.info("🎯 Collecting control baseline for evaluation comparisons...")
         baseline_start = time.time()
         
@@ -1657,6 +1750,11 @@ class AgentGRPOTrainer:
         eval_stats, computed = self._compute_eval_statistics(
             control_groups, baseline_time, step=-1, is_baseline=True
         )
+        
+        # Add reward map to eval_stats for future loading
+        eval_stats["control_reward_map"] = {
+            query_id: rewards for query_id, rewards in self.control_reward_map.items()
+        }
         
         # Save to file with timestamp to avoid overwriting
         eval_log_dir = self.output_dir / "eval_logs"

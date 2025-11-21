@@ -43,6 +43,7 @@ from grpo import (
     prepare_dataset,
     find_latest_checkpoint,
     find_best_checkpoint,
+    find_auto_resume_checkpoint,
 )
 
 # Configure logging with immediate flushing
@@ -143,6 +144,14 @@ def main():
         verbose=os.environ.get("VERBOSE", "false").split('#')[0].strip().lower() == "true",
     )
     
+    # Check if we should run baseline eval (default: True)
+    run_baseline_eval = os.environ.get("RUN_BASELINE_EVAL", "true").split('#')[0].strip().lower() == "true"
+    
+    print(f"Run baseline eval: {run_baseline_eval}", flush=True)
+    if not run_baseline_eval:
+        print("⚡ Baseline eval will be loaded from existing JSON (if available)", flush=True)
+    logger.info(f"Run baseline eval: {run_baseline_eval}")
+    
     # Initialize wandb
     wandb_project = os.environ.get("WANDB_PROJECT", "email-agent-grpo")
     wandb_entity = os.environ.get("WANDB_ENTITY", None)
@@ -226,25 +235,45 @@ def main():
         resume_from_checkpoint = args.resume_from_checkpoint
         print(f"\n📂 Resuming from specified checkpoint: {resume_from_checkpoint}", flush=True)
         logger.info(f"Resuming from specified checkpoint: {resume_from_checkpoint}")
-    elif args.resume or args.resume_best:
-        # Auto-detect checkpoint
-        if args.resume_best:
-            result = find_best_checkpoint(config.output_dir)
-            if result:
-                resume_from_checkpoint, accuracy = result
-                print(f"\n📂 Resuming from best checkpoint (accuracy: {accuracy:.2%}): {resume_from_checkpoint}", flush=True)
-                logger.info(f"Resuming from best checkpoint (accuracy: {accuracy:.2%}): {resume_from_checkpoint}")
-            else:
-                print("\n⚠️  No checkpoints found, starting from scratch", flush=True)
-                logger.warning("No checkpoints found, starting from scratch")
+    elif args.resume_best:
+        # Explicitly request best checkpoint (by accuracy)
+        result = find_best_checkpoint(config.output_dir)
+        if result:
+            resume_from_checkpoint, accuracy = result
+            print(f"\n📂 Resuming from best checkpoint (accuracy: {accuracy:.2%}): {resume_from_checkpoint}", flush=True)
+            logger.info(f"Resuming from best checkpoint (accuracy: {accuracy:.2%}): {resume_from_checkpoint}")
         else:
-            resume_from_checkpoint = find_latest_checkpoint(config.output_dir)
-            if resume_from_checkpoint:
-                print(f"\n📂 Resuming from latest checkpoint: {resume_from_checkpoint}", flush=True)
-                logger.info(f"Resuming from latest checkpoint: {resume_from_checkpoint}")
+            print("\n⚠️  No checkpoints found, starting from scratch", flush=True)
+            logger.warning("No checkpoints found, starting from scratch")
+    else:
+        # Default behavior: auto-resume (best marked checkpoint if exists, otherwise latest)
+        # This applies whether --resume is specified or not
+        resume_from_checkpoint = find_auto_resume_checkpoint(config.output_dir)
+        if resume_from_checkpoint:
+            # Check if this checkpoint has a best marker
+            from pathlib import Path
+            state_file = Path(resume_from_checkpoint) / "training_state.json"
+            has_best_marker = False
+            if state_file.exists():
+                try:
+                    import json
+                    with open(state_file, 'r') as f:
+                        state = json.load(f)
+                    best_model_path = state.get("best_model_path")
+                    if best_model_path and best_model_path != "None":
+                        has_best_marker = True
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            
+            if has_best_marker:
+                print(f"\n📂 Auto-resuming from checkpoint with best marker: {resume_from_checkpoint}", flush=True)
+                logger.info(f"Auto-resuming from checkpoint with best marker: {resume_from_checkpoint}")
             else:
-                print("\n⚠️  No checkpoints found, starting from scratch", flush=True)
-                logger.warning("No checkpoints found, starting from scratch")
+                print(f"\n📂 Auto-resuming from latest checkpoint: {resume_from_checkpoint}", flush=True)
+                logger.info(f"Auto-resuming from latest checkpoint: {resume_from_checkpoint}")
+        else:
+            print("\n📝 No checkpoints found, starting from scratch", flush=True)
+            logger.info("No checkpoints found, starting from scratch")
     
     # Initialize OpenRouter client (for judge)
     print("\n🔑 Checking OpenRouter API key...", flush=True)
@@ -413,6 +442,7 @@ def main():
             min_group_std=get_env_float("MIN_GROUP_STD", "0.05"),  # Minimum std to keep a group
             resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None,
             use_wandb=wandb_mode != "disabled",
+            run_baseline_eval=run_baseline_eval,
         )
         os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
         trainer.train()
