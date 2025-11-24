@@ -13,6 +13,7 @@ The email agent is trained to search through a database of emails (Enron dataset
 - **Tool Use**: Agent learns to use search and read tools to find information
 - **Reward Shaping**: Complex reward function with partial credit for intermediate progress
 - **Base Model**: Qwen3-14B-Base with LoRA fine-tuning
+- **Detailed Rollout Logging**: Comprehensive JSON logs for every rollout, including tool calls, judge decisions, and reward breakdown (see [ROLLOUT_LOGGING.md](ROLLOUT_LOGGING.md))
 
 ## Architecture
 
@@ -83,6 +84,35 @@ For multi-GPU training with accelerate:
 
 ```bash
 accelerate launch train_grpo.py
+```
+
+### Enable Detailed Rollout Logging
+
+To save comprehensive JSON logs for debugging and analysis:
+
+```bash
+python train_grpo.py --enable-detailed-logging
+```
+
+This creates detailed logs in `outputs/rollout_logs/` for every rollout, including:
+- Complete conversation history
+- Tool call details and results
+- Judge evaluation process
+- Reward breakdown and metrics
+
+See [ROLLOUT_LOGGING.md](ROLLOUT_LOGGING.md) for detailed documentation and [examples/rollout_logging_example.md](examples/rollout_logging_example.md) for usage examples.
+
+Analyze logs with:
+
+```bash
+# View latest step summary
+python scripts/analyze_rollout_logs.py
+
+# Compare multiple steps
+python scripts/analyze_rollout_logs.py --compare "0,10,20"
+
+# Show failure cases
+python scripts/analyze_rollout_logs.py --step 10 --failures
 ```
 
 ### Configuration

@@ -26,8 +26,15 @@ async def execute_rollout(
     rollout_info: Dict = None,
     rollout_index: int = 0,
     num_rollouts: int = 4,
+    enable_detailed_logging: bool = False,
+    training_step: int = 0,
 ):
-    """Execute a real agent rollout."""
+    """Execute a real agent rollout.
+    
+    Returns:
+        Tuple of (conversation, reward, rubric, rollout_log)
+        rollout_log is None if enable_detailed_logging is False
+    """
     from email_agent.agent import EmailAgent
     
     agent = EmailAgent(
@@ -37,9 +44,11 @@ async def execute_rollout(
         openai_client=openai_client,
         rollout_index=rollout_index,
         num_rollouts=num_rollouts,
+        enable_detailed_logging=enable_detailed_logging,
+        training_step=training_step,
     )
     
-    rubric, conversation = await agent.run_query(query, verbose=verbose)
+    rubric, conversation, rollout_log = await agent.run_query(query, verbose=verbose)
     reward = calculate_reward(policy_config, rubric)
     
     # Log compact turn-by-turn summary if requested
@@ -196,7 +205,7 @@ async def execute_rollout(
         
         print(f"{'─'*80}\n", flush=True)
     
-    return conversation, reward, rubric
+    return conversation, reward, rubric, rollout_log
 
 
 def simple_reward_function(
@@ -285,7 +294,7 @@ def rollout_reward_function(
             query = queries_dict[query_id]
             
             # Execute real rollout
-            conversation, reward, metrics = loop.run_until_complete(
+            conversation, reward, metrics, _ = loop.run_until_complete(
                 execute_rollout(
                     query=query,
                     model=model,
@@ -295,6 +304,8 @@ def rollout_reward_function(
                     verbose=False,
                     rollout_index=0,  # Use base temperature for single rollouts
                     num_rollouts=1,
+                    enable_detailed_logging=False,  # Don't log in reward function
+                    training_step=0,
                 )
             )
             

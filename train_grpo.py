@@ -125,6 +125,11 @@ def main():
         action="store_true",
         help="Resume from best checkpoint (highest accuracy) instead of latest"
     )
+    parser.add_argument(
+        "--enable-detailed-logging",
+        action="store_true",
+        help="Enable detailed rollout logging (saves JSON logs to outputs/rollout_logs/)"
+    )
     args = parser.parse_args()
     
     # Load configuration
@@ -443,6 +448,7 @@ def main():
             resume_from_checkpoint=str(resume_from_checkpoint) if resume_from_checkpoint else None,
             use_wandb=wandb_mode != "disabled",
             run_baseline_eval=run_baseline_eval,
+            enable_detailed_logging=args.enable_detailed_logging,  # Enable detailed rollout logging
         )
         os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
         trainer.train()

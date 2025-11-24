@@ -14,6 +14,7 @@ from email_agent.rollout import (
     determine_if_answer_is_correct,
     calculate_reward,
 )
+from email_agent.rollout_logger import RolloutLogBuilder, RolloutLog
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class EmailAgent:
         openai_client: Optional[AsyncOpenAI] = None,
         rollout_index: int = 0,
         num_rollouts: int = 4,
+        enable_detailed_logging: bool = False,
+        training_step: int = 0,
     ):
         """Initialize the agent.
         
@@ -48,6 +51,8 @@ class EmailAgent:
             openai_client: OpenAI client for judge (optional, only needed for evaluation)
             rollout_index: Index of this rollout within its group (0 to num_rollouts-1)
             num_rollouts: Total number of rollouts in the group
+            enable_detailed_logging: Whether to accumulate detailed rollout logs
+            training_step: Current training step number
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -56,12 +61,15 @@ class EmailAgent:
         self.tools = get_tools_schema()
         self.rollout_index = rollout_index
         self.num_rollouts = num_rollouts
+        self.enable_detailed_logging = enable_detailed_logging
+        self.training_step = training_step
+        self.log_builder: Optional[RolloutLogBuilder] = None
         
     async def run_query(
         self,
         query: SyntheticQuery,
         verbose: bool = False,
-    ) -> Tuple[EvaluationRubric, List[Dict[str, Any]]]:
+    ) -> Tuple[EvaluationRubric, List[Dict[str, Any]], Optional[RolloutLog]]:
         """Run the agent on a single query.
         
         Args:
@@ -69,7 +77,8 @@ class EmailAgent:
             verbose: Whether to print detailed logs
             
         Returns:
-            Tuple of (rubric, conversation_history)
+            Tuple of (rubric, conversation_history, rollout_log)
+            rollout_log is None if detailed logging is disabled
         """
         rubric = EvaluationRubric()
         
@@ -83,6 +92,43 @@ class EmailAgent:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": query.question},
         ]
+        
+        # Calculate temperature and repetition penalty
+        if self.policy_config.enable_dynamic_temperature:
+            temperature = self.policy_config.base_temperature + (
+                self.rollout_index * self.policy_config.temperature_increment
+            )
+            repetition_penalty = self.policy_config.base_repetition_penalty + (
+                self.rollout_index * self.policy_config.repetition_penalty_increment
+            )
+        else:
+            temperature = 0.7
+            repetition_penalty = 1.0
+        
+        # Initialize log builder if detailed logging is enabled
+        if self.enable_detailed_logging:
+            self.log_builder = RolloutLogBuilder(
+                query=query,
+                system_prompt=system_prompt,
+                max_turns=self.policy_config.max_turns,
+                policy_config={
+                    "max_turns": self.policy_config.max_turns,
+                    "max_tokens": self.policy_config.max_tokens,
+                    "enable_dynamic_temperature": self.policy_config.enable_dynamic_temperature,
+                    "base_temperature": self.policy_config.base_temperature,
+                    "temperature_increment": self.policy_config.temperature_increment,
+                    "base_repetition_penalty": self.policy_config.base_repetition_penalty,
+                    "repetition_penalty_increment": self.policy_config.repetition_penalty_increment,
+                },
+                step=self.training_step,
+                rollout_index=self.rollout_index,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+            )
+            
+            # Log initial conversation messages
+            for msg in conversation:
+                self.log_builder.log_conversation_message(msg)
         
         if verbose:
             print("\n" + "="*80)
@@ -112,11 +158,16 @@ class EmailAgent:
                 rubric.total_output_tokens += output_tokens
                 
                 # Add assistant message to conversation
-                conversation.append({
+                assistant_msg = {
                     "role": "assistant",
                     "content": response_message.get("content"),
                     "tool_calls": response_message.get("tool_calls"),
-                })
+                }
+                conversation.append(assistant_msg)
+                
+                # Log to rollout builder
+                if self.log_builder:
+                    self.log_builder.log_conversation_message(assistant_msg)
                 
                 # Check if there are tool calls from LiteLLM
                 if response_message.get("tool_calls"):
@@ -166,7 +217,14 @@ class EmailAgent:
         if verbose:
             self._print_evaluation_summary(rubric, query)
         
-        return rubric, conversation
+        # Build final rollout log if detailed logging is enabled
+        rollout_log = None
+        if self.log_builder:
+            from email_agent.rollout import calculate_reward
+            reward = calculate_reward(self.policy_config, rubric)
+            rollout_log = self.log_builder.build(rubric, reward)
+        
+        return rubric, conversation, rollout_log
     
     def _generate_response(
         self, 
@@ -389,6 +447,13 @@ class EmailAgent:
         
         rubric.num_sources = len(source_message_ids)
         
+        # Log final answer to rollout builder
+        if self.log_builder:
+            self.log_builder.log_final_answer(
+                answer=final_answer,
+                source_message_ids=source_message_ids,
+            )
+        
         if final_answer == "I don't know":
             rubric.returned_i_dont_know = True
             if verbose:
@@ -499,11 +564,16 @@ class EmailAgent:
                         print(f"   ✓ {json.dumps(tool_result, indent=4)[:200]}...")
             
             # Add tool result to conversation in OpenAI format
-            conversation.append({
+            tool_msg = {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
                 "content": json.dumps(tool_result),
-            })
+            }
+            conversation.append(tool_msg)
+            
+            # Log to rollout builder
+            if self.log_builder:
+                self.log_builder.log_conversation_message(tool_msg)
             
             if should_break_inner:
                 should_break = True
@@ -534,6 +604,7 @@ class EmailAgent:
             Tuple of (tool_result, should_break)
         """
         should_break = False
+        error_msg = None
         
         if tool_name == "search_emails":
             try:
@@ -617,13 +688,37 @@ class EmailAgent:
                     else:
                         print(f"   ✗ Correct email NOT in results")
                 
+                # Log to rollout builder
+                if self.log_builder:
+                    self.log_builder.log_tool_call(
+                        turn_number=rubric.num_turns,
+                        tool_name=tool_name,
+                        tool_arguments=tool_args,
+                        tool_result=result,
+                        correct_message_id=query.message_ids[0],
+                        error=None,
+                    )
+                
                 return result, should_break
                 
             except Exception as e:
                 rubric.bad_tool_call_args = True
                 logger.error(f"Error searching emails: {e}")
+                error_msg = str(e)
                 should_break = True
-                return {"error": str(e)}, should_break
+                
+                # Log error to rollout builder
+                if self.log_builder:
+                    self.log_builder.log_tool_call(
+                        turn_number=rubric.num_turns,
+                        tool_name=tool_name,
+                        tool_arguments=tool_args,
+                        tool_result={"error": error_msg},
+                        correct_message_id=query.message_ids[0],
+                        error=error_msg,
+                    )
+                
+                return {"error": error_msg}, should_break
                 
         elif tool_name == "read_email":
             message_id_to_read = tool_args.get("message_id")
@@ -648,7 +743,21 @@ class EmailAgent:
                 rubric.ever_tried_to_read_invalid_email = True
                 if verbose:
                     print(f"   ❌ Email not found!")
-                return {"error": "Email not found"}, should_break
+                
+                error_result = {"error": "Email not found"}
+                
+                # Log to rollout builder
+                if self.log_builder:
+                    self.log_builder.log_tool_call(
+                        turn_number=rubric.num_turns,
+                        tool_name=tool_name,
+                        tool_arguments=tool_args,
+                        tool_result=error_result,
+                        correct_message_id=query.message_ids[0],
+                        error="Email not found",
+                    )
+                
+                return error_result, should_break
             else:
                 if verbose:
                     print(f"   ✓ Successfully read email")
@@ -659,7 +768,21 @@ class EmailAgent:
                         print(f"   ✓ This is the CORRECT email!")
                     else:
                         print(f"   ✗ This is NOT the correct email (correct: {query.message_ids[0]})")
-                return email_content.model_dump(), should_break
+                
+                result = email_content.model_dump()
+                
+                # Log to rollout builder
+                if self.log_builder:
+                    self.log_builder.log_tool_call(
+                        turn_number=rubric.num_turns,
+                        tool_name=tool_name,
+                        tool_arguments=tool_args,
+                        tool_result=result,
+                        correct_message_id=query.message_ids[0],
+                        error=None,
+                    )
+                
+                return result, should_break
                 
         elif tool_name == "return_final_answer":
             # Handle final answer tool call
@@ -669,13 +792,41 @@ class EmailAgent:
                 rubric,
                 verbose,
             )
-            return {"status": "Final answer submitted"}, should_break
+            
+            result = {"status": "Final answer submitted"}
+            
+            # Log to rollout logger
+            if self.log_builder:
+                self.log_builder.log_tool_call(
+                    turn_number=rubric.num_turns,
+                    tool_name=tool_name,
+                    tool_arguments=tool_args,
+                    tool_result=result,
+                    correct_message_id=query.message_ids[0],
+                    error=None,
+                )
+            
+            return result, should_break
             
         else:
             rubric.bad_tool_call_name = True
             should_break = True
             logger.error(f"Unknown tool name: {tool_name}")
-            return {"error": f"Unknown tool: {tool_name}"}, should_break
+            error_msg = f"Unknown tool: {tool_name}"
+            error_result = {"error": error_msg}
+            
+            # Log error to rollout logger
+            if self.log_builder:
+                self.log_builder.log_tool_call(
+                    turn_number=rubric.num_turns,
+                    tool_name=tool_name,
+                    tool_arguments=tool_args,
+                    tool_result=error_result,
+                    correct_message_id=query.message_ids[0],
+                    error=error_msg,
+                )
+            
+            return error_result, should_break
     
     async def _judge_answer(
         self,
@@ -697,12 +848,43 @@ class EmailAgent:
             logger.warning("OpenAI client not available for judging")
             return False
         
-        return await determine_if_answer_is_correct(
+        # Build judge prompts (copied from rollout.py for logging)
+        system_prompt = (
+            "You will be given a question and two different answers to the question: "
+            "the correct answer and the answer given by an AI. Your job is to determine "
+            "if the answer given by the AI is correct. Return True if the answer is "
+            "semantically similar to the correct answer, and False otherwise. "
+            "Return only the word True or False, no other text."
+        )
+        
+        user_prompt = (
+            f"Question: {query.question}\n"
+            f"Correct answer: {query.answer}\n"
+            f"AI answer: {answer}"
+        )
+        
+        # Call the judge function
+        is_correct = await determine_if_answer_is_correct(
             answer=answer,
             query=query,
             openai_client=self.openai_client,
             verbose=verbose,
         )
+        
+        # Log judge evaluation if logger is available
+        # Note: We don't have the actual judge response here, so we'll just log the prompts
+        # and the result. The actual response is logged in determine_if_answer_is_correct
+        if self.log_builder:
+            self.log_builder.log_judge_evaluation(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                agent_answer=answer,
+                ground_truth_answer=query.answer,
+                judge_response="True" if is_correct else "False",  # Simplified
+                is_correct=is_correct,
+            )
+        
+        return is_correct
     
     def _print_evaluation_summary(self, rubric: EvaluationRubric, query: SyntheticQuery):
         """Print evaluation summary."""

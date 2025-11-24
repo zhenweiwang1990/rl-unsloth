@@ -46,6 +46,7 @@ class TrajectorySample:
     group_id: int
     advantage: Optional[float] = None  # Group-level advantage for training
     turn_advantages: Optional[List[float]] = None  # Per-turn advantages (for detailed logging)
+    rollout_log: Optional[object] = None  # Detailed rollout log (RolloutLog), if enabled
 
 
 @dataclass
@@ -106,6 +107,7 @@ class AgentGRPOTrainer:
         max_seq_length: Optional[int] = None,
         use_wandb: bool = False,
         run_baseline_eval: bool = True,  # Whether to run baseline eval or load from JSON
+        enable_detailed_logging: bool = False,  # Whether to save detailed rollout logs
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -137,6 +139,7 @@ class AgentGRPOTrainer:
         self.pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
         self.use_wandb = use_wandb and WANDB_AVAILABLE
         self.run_baseline_eval = run_baseline_eval
+        self.enable_detailed_logging = enable_detailed_logging
         
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -187,6 +190,7 @@ class AgentGRPOTrainer:
         logger.info(f"Early stopping patience: {patience} evaluations")
         logger.info(f"Min group std for training: {min_group_std:.3f} (filters low-variance groups)")
         logger.info(f"Verbose logging: {self.verbose} (detailed rollout logs: {'enabled' if self.verbose else 'disabled'})")
+        logger.info(f"Detailed rollout logging: {'enabled' if self.enable_detailed_logging else 'disabled'} (saves JSON logs to outputs/rollout_logs/)")
         logger.info(f"Wandb logging: {'enabled' if self.use_wandb else 'disabled'}")
         logger.info("="*60)
     
@@ -903,6 +907,13 @@ class AgentGRPOTrainer:
             )
             print(f"{'='*80}\n", flush=True)
         
+        # Save rollout logs if detailed logging is enabled
+        if self.enable_detailed_logging:
+            from email_agent.rollout_logger import save_rollout_logs
+            rollout_logs = [sample.rollout_log for sample in collected_samples if sample.rollout_log is not None]
+            if rollout_logs:
+                save_rollout_logs(rollout_logs, output_dir=f"{self.output_dir}/rollout_logs")
+        
         return list(groups_dict.values()), stats
     
     def _compute_turn_advantages(
@@ -1157,7 +1168,7 @@ class AgentGRPOTrainer:
                     "is_evaluation": is_evaluation,
                 }
             
-            conversation, reward, rubric = await execute_rollout(
+            conversation, reward, rubric, rollout_log = await execute_rollout(
                 query=query,
                 model=model_override or self.model,
                 tokenizer=self.tokenizer,
@@ -1168,6 +1179,8 @@ class AgentGRPOTrainer:
                 rollout_info=rollout_info,
                 rollout_index=rollout_idx,
                 num_rollouts=self.num_rollouts if not is_evaluation else self.eval_rollouts,
+                enable_detailed_logging=self.enable_detailed_logging,
+                training_step=step_num,
             )
             
             return TrajectorySample(
@@ -1178,6 +1191,7 @@ class AgentGRPOTrainer:
                 rubric=rubric,
                 rollout_idx=rollout_idx,
                 group_id=group_id,
+                rollout_log=rollout_log,
             )
         
         if semaphore is None:
