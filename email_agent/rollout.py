@@ -129,10 +129,19 @@ def calculate_reward(
             # This is the main penalty - giving up early is worse than running out of turns
             early_giveup_penalty += 1.0  # Base penalty for early give-up
             
+            # Additional penalty based on remaining turns (encourages using all turns)
+            # If max_turns=10 and agent gave up at turn 4, they wasted 6 turns
+            remaining_turns = policy_config.max_turns - rubric.num_turns
+            if remaining_turns > 0:
+                # Penalty: -0.05 per unused turn (encourages using all available turns)
+                unused_turn_penalty = 0.05 * remaining_turns
+                early_giveup_penalty += unused_turn_penalty
+            
             rubric.gave_up_too_early = True
             logger.warning(
                 f"Agent gave up EARLY (before turn budget exhausted): "
-                f"only {rubric.num_unique_searches} unique searches. "
+                f"only {rubric.num_unique_searches} unique searches, "
+                f"{rubric.num_turns}/{policy_config.max_turns} turns used. "
                 f"Total penalty: -{early_giveup_penalty:.2f}"
             )
             base_reward -= early_giveup_penalty
@@ -165,6 +174,16 @@ def calculate_reward(
                     f"Agent tried different search parameters after zero results "
                     f"({rubric.num_retry_after_zero} times). Bonus: +{retry_bonus:.2f}"
                 )
+            
+            # REWARD for using more turns (encourages using all available turns)
+            # This rewards agents that try harder and use more of their turn budget
+            # The reward is proportional to how many turns were used
+            turn_usage_bonus = 0.02 * rubric.num_turns  # +0.08 for 4 turns, +0.14 for 7 turns
+            effort_bonus += turn_usage_bonus
+            logger.info(
+                f"Agent used {rubric.num_turns}/{policy_config.max_turns} turns. "
+                f"Turn usage bonus: +{turn_usage_bonus:.2f}"
+            )
             
             base_reward += effort_bonus
         
