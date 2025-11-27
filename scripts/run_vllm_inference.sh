@@ -32,7 +32,7 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "  LORA_NAME           - LoRA adapter name (default: email_agent_lora)"
     echo "  GPU_DEVICES         - GPU devices to use (default: all)"
     echo "  TENSOR_PARALLEL_SIZE - Tensor parallelism size (default: 1)"
-    echo "  MAX_MODEL_LEN       - Maximum model length (default: 16384)"
+    echo "  MAX_MODEL_LEN       - Maximum model length (default: 32768)"
     echo "  TRUST_REMOTE_CODE   - Trust remote code (default: true)"
     echo ""
     echo "Examples:"

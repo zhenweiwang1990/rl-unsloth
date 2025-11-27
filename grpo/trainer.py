@@ -1261,7 +1261,7 @@ class AgentGRPOTrainer:
     def _tokenize_samples(self, samples: List[TrajectorySample]) -> List[TokenizedTrajectory]:
         """Tokenize trajectories and enforce max sequence length with process-based advantages."""
         tokenized: List[TokenizedTrajectory] = []
-        max_len = self.max_seq_length or 16384
+        max_len = self.max_seq_length or 32768
         
         for sample in samples:
             if sample.advantage is None:
@@ -1356,7 +1356,7 @@ class AgentGRPOTrainer:
         
         pad_id = self.pad_token_id
         max_seq = min(
-            self.max_seq_length or 16384,
+            self.max_seq_length or 32768,
             max(sample.input_ids.size(0) for sample in tokenized_samples),
         )
         
