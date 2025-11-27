@@ -93,7 +93,7 @@ docker run -d -it \
     $ENV_FILE \
     -v $(pwd)/data:/workspace/data \
     -v $(pwd)/outputs:/workspace/outputs \
-    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -v $HOME/.cache:/root/.cache \
     -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
