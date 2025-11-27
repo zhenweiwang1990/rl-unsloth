@@ -83,8 +83,14 @@ class EmailAgent:
         rubric = EvaluationRubric()
         
         # Track tool call history to detect repetitions
-        # Key: (tool_name, normalized_args), Value: result (for zero-result detection)
+        # For searches: Key: (tool_name, normalized_args), Value: result count
         tool_call_history = {}
+        
+        # Track read email history to detect repeated reads
+        read_history = set()  # Set of message_ids that have been read
+        
+        # Track search history for strategy analysis
+        search_history = []  # List of {params, result_count, turn}
         
         # Create initial conversation
         system_prompt = create_system_prompt(query, self.policy_config.max_turns)
@@ -178,6 +184,8 @@ class EmailAgent:
                         rubric,
                         conversation,
                         tool_call_history,
+                        read_history,
+                        search_history,
                         verbose,
                     )
                     if should_break:
@@ -447,6 +455,18 @@ class EmailAgent:
         
         rubric.num_sources = len(source_message_ids)
         
+        # ========== NEW: Calculate source precision ==========
+        if len(source_message_ids) > 0:
+            rubric.num_correct_sources = sum(
+                1 for sid in source_message_ids if sid == query.message_ids[0]
+            )
+            rubric.num_incorrect_sources = len(source_message_ids) - rubric.num_correct_sources
+            rubric.source_precision = rubric.num_correct_sources / len(source_message_ids)
+        else:
+            rubric.num_correct_sources = 0
+            rubric.num_incorrect_sources = 0
+            rubric.source_precision = 0.0
+        
         # Log final answer to rollout builder
         if self.log_builder:
             self.log_builder.log_final_answer(
@@ -461,8 +481,8 @@ class EmailAgent:
         else:
             rubric.attempted_answer = True
             
-            # Check sources
-            rubric.sources_correct = query.message_ids[0] in source_message_ids
+            # Check sources (updated logic: all sources must be correct)
+            rubric.sources_correct = (rubric.source_precision == 1.0 and rubric.num_correct_sources > 0)
             
             # Call judge to check answer (if OpenAI client available)
             if self.openai_client:
@@ -492,6 +512,8 @@ class EmailAgent:
         rubric: EvaluationRubric,
         conversation: List[Dict],
         tool_call_history: Dict,
+        read_history: set,
+        search_history: List[Dict],
         verbose: bool,
     ) -> bool:
         """Execute tool calls and update conversation.
@@ -502,6 +524,8 @@ class EmailAgent:
             rubric: Evaluation rubric to update
             conversation: Conversation history to update
             tool_call_history: History of previous tool calls for repetition detection
+            read_history: Set of message_ids that have been read
+            search_history: List of search history for strategy analysis
             verbose: Whether to print logs
             
         Returns:
@@ -546,6 +570,8 @@ class EmailAgent:
                 query,
                 rubric,
                 tool_call_history,
+                read_history,
+                search_history,
                 verbose,
             )
             
@@ -588,6 +614,8 @@ class EmailAgent:
         query: SyntheticQuery,
         rubric: EvaluationRubric,
         tool_call_history: Dict,
+        read_history: set,
+        search_history: List[Dict],
         verbose: bool,
     ) -> Tuple[Any, bool]:
         """Execute a single tool call.
@@ -598,6 +626,8 @@ class EmailAgent:
             query: The query being processed
             rubric: Evaluation rubric to update
             tool_call_history: History of previous tool calls for repetition detection
+            read_history: Set of message_ids that have been read
+            search_history: List of search history for strategy analysis
             verbose: Whether to print logs
             
         Returns:
@@ -655,14 +685,55 @@ class EmailAgent:
                     inbox=query.inbox_address,
                 )
                 result = [asdict(r) for r in search_results]
+                result_count = len(search_results)
                 
                 # Track this search in history (update or add)
-                tool_call_history[search_key] = len(search_results)
+                tool_call_history[search_key] = result_count
                 
-                # Track zero-result searches
-                num_zero_before = rubric.num_zero_result_searches
-                if len(search_results) == 0:
-                    rubric.num_zero_result_searches += 1
+                # ========== NEW: Categorize search results ==========
+                if result_count == 0:
+                    rubric.num_searches_with_zero_results += 1
+                elif result_count >= 10:
+                    rubric.num_searches_with_too_many_results += 1
+                else:  # 1-9 results
+                    rubric.num_searches_with_optimal_results += 1
+                
+                # ========== NEW: Analyze search strategy ==========
+                if len(search_history) > 0:
+                    prev_search = search_history[-1]
+                    prev_count = prev_search['result_count']
+                    prev_params = prev_search['params']
+                    
+                    # Scenario 1: Previous search returned 0, should broaden
+                    if prev_count == 0:
+                        if self._is_broader_search(tool_args, prev_params):
+                            rubric.broadened_search_after_zero_results += 1
+                            if verbose:
+                                print(f"\n✓ Good strategy: Broadened search after 0 results")
+                    
+                    # Scenario 2: Previous search returned ≥10, should narrow
+                    elif prev_count >= 10:
+                        if self._is_narrower_search(tool_args, prev_params):
+                            rubric.narrowed_search_after_many_results += 1
+                            if verbose:
+                                print(f"\n✓ Good strategy: Narrowed search after {prev_count} results")
+                    
+                    # Scenario 3: Previous search returned 1-9 (optimal), should read not search again
+                    elif 1 <= prev_count <= 9:
+                        rubric.ignored_optimal_results += 1
+                        if verbose:
+                            print(f"\n⚠️ Suboptimal: Previous search had {prev_count} results (ideal range)")
+                            print(f"   Should read emails instead of searching again")
+                
+                # Add this search to history
+                search_history.append({
+                    'params': tool_args.copy(),
+                    'result_count': result_count,
+                    'turn': rubric.num_turns,
+                })
+                
+                # Track zero-result searches (old logic, kept for compatibility)
+                num_zero_before = rubric.num_zero_result_searches - (1 if result_count == 0 else 0)
                 
                 # Check if this is a retry after a previous zero-result search
                 # (Good behavior: trying different parameters after getting no results)
@@ -678,7 +749,9 @@ class EmailAgent:
                 found_right = False
                 for r in search_results:
                     if r.message_id == query.message_ids[0]:
-                        rubric.ever_found_right_email = True
+                        if not rubric.ever_found_right_email:
+                            rubric.ever_found_right_email = True
+                            rubric.turn_found_right_email = rubric.num_turns
                         found_right = True
                 
                 if verbose:
@@ -730,12 +803,47 @@ class EmailAgent:
                     print(f"\n❌ Invalid message_id type: {type(message_id_to_read)}")
                 return {"error": "Invalid message_id type"}, should_break
             
+            # ========== NEW: Track read repetitions ==========
+            rubric.num_total_reads += 1
+            
+            is_repeat_read = message_id_to_read in read_history
+            if is_repeat_read:
+                rubric.num_repeated_reads += 1
+                
+                # Extra tracking if re-reading the correct email
+                if message_id_to_read == query.message_ids[0]:
+                    rubric.repeated_correct_email += 1
+                    if verbose:
+                        print(f"\n⚠️ WARNING: Re-reading the CORRECT email!")
+                        print(f"   This email was already read. Significant penalty will apply.")
+                
+                if verbose:
+                    print(f"\n⚠️ WARNING: Re-reading email {message_id_to_read[:20]}...")
+                    print(f"   This email was already read (repetition #{rubric.num_repeated_reads})")
+                    print(f"   Repetition penalty will apply.")
+            else:
+                rubric.num_unique_reads += 1
+                read_history.add(message_id_to_read)
+            
+            # ========== Check if reading after optimal search ==========
+            if len(search_history) > 0:
+                last_search = search_history[-1]
+                # Check if the last action was a search with optimal results
+                if last_search['turn'] == rubric.num_turns - 1:  # Last turn was search
+                    if 1 <= last_search['result_count'] <= 9:
+                        rubric.read_after_optimal_search += 1
+                        if verbose:
+                            print(f"\n✓ Good strategy: Reading email after optimal search "
+                                  f"({last_search['result_count']} results)")
+            
             if verbose:
                 print(f"\n📧 Reading email: {message_id_to_read}")
             
             is_correct = message_id_to_read == query.message_ids[0]
             if is_correct:
-                rubric.ever_read_right_email = True
+                if not rubric.ever_read_right_email:
+                    rubric.ever_read_right_email = True
+                    rubric.turn_read_right_email = rubric.num_turns
             
             email_content = read_email(message_id_to_read)
             
@@ -885,6 +993,50 @@ class EmailAgent:
             )
         
         return is_correct
+    
+    def _is_broader_search(self, current_params: Dict, prev_params: Dict) -> bool:
+        """Check if current search is broader than previous search.
+        
+        A search is considered broader if:
+        - Fewer keywords
+        - Removed filters (from_addr, to_addr, etc.)
+        """
+        curr_keywords = set(current_params.get('keywords', []))
+        prev_keywords = set(prev_params.get('keywords', []))
+        
+        # Fewer keywords = broader
+        if len(curr_keywords) < len(prev_keywords):
+            return True
+        
+        # Removed filters = broader
+        filters_removed = (
+            (prev_params.get('from_addr') and not current_params.get('from_addr')) or
+            (prev_params.get('to_addr') and not current_params.get('to_addr'))
+        )
+        
+        return filters_removed
+    
+    def _is_narrower_search(self, current_params: Dict, prev_params: Dict) -> bool:
+        """Check if current search is narrower than previous search.
+        
+        A search is considered narrower if:
+        - More keywords
+        - Added filters (from_addr, to_addr, etc.)
+        """
+        curr_keywords = set(current_params.get('keywords', []))
+        prev_keywords = set(prev_params.get('keywords', []))
+        
+        # More keywords = narrower
+        if len(curr_keywords) > len(prev_keywords):
+            return True
+        
+        # Added filters = narrower
+        filters_added = (
+            (current_params.get('from_addr') and not prev_params.get('from_addr')) or
+            (current_params.get('to_addr') and not prev_params.get('to_addr'))
+        )
+        
+        return filters_added
     
     def _print_evaluation_summary(self, rubric: EvaluationRubric, query: SyntheticQuery):
         """Print evaluation summary."""

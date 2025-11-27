@@ -35,7 +35,7 @@ class EvaluationRubric:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     
-    # Repetition tracking
+    # Search repetition tracking
     num_repeated_searches: int = 0  # Number of times the agent repeated the exact same search
     num_zero_result_searches: int = 0  # Number of searches that returned 0 results
     repeated_zero_result_search: bool = False  # Did agent repeat a search that already returned 0 results?
@@ -45,6 +45,31 @@ class EvaluationRubric:
     num_total_searches: int = 0  # Total number of search attempts (including repeats)
     num_retry_after_zero: int = 0  # Number of times agent tried different search after getting 0 results (good behavior)
     gave_up_too_early: bool = False  # Did agent give up with "I don't know" after too few unique searches?
+    
+    # Read tracking (NEW)
+    num_total_reads: int = 0  # Total number of read_email calls
+    num_unique_reads: int = 0  # Number of unique emails read
+    num_repeated_reads: int = 0  # Number of times reading already-read emails
+    repeated_correct_email: int = 0  # Number of times re-reading the correct email (bad!)
+    
+    # Search strategy quality (NEW)
+    num_searches_with_zero_results: int = 0  # Searches returning 0 results
+    num_searches_with_too_many_results: int = 0  # Searches returning ≥10 results
+    num_searches_with_optimal_results: int = 0  # Searches returning 1-9 results (ideal)
+    
+    broadened_search_after_zero_results: int = 0  # Broadened search after 0 results (good!)
+    narrowed_search_after_many_results: int = 0  # Narrowed search after ≥10 results (good!)
+    read_after_optimal_search: int = 0  # Read email after 1-9 search results (good!)
+    ignored_optimal_results: int = 0  # Continued searching after 1-9 results (bad)
+    
+    # Sources precision (NEW)
+    num_correct_sources: int = 0  # Number of correct sources cited
+    num_incorrect_sources: int = 0  # Number of incorrect sources cited
+    source_precision: float = 0.0  # Precision of sources (correct / total)
+    
+    # Timing information (NEW)
+    turn_found_right_email: int = -1  # Turn number when correct email was found (-1 if never)
+    turn_read_right_email: int = -1  # Turn number when correct email was read (-1 if never)
 
     def to_metrics(self) -> Dict[str, float | int]:
         """Convert rubric to metrics dictionary."""
@@ -54,172 +79,224 @@ class EvaluationRubric:
 def calculate_reward(
     policy_config: PolicyConfig, rubric: EvaluationRubric
 ) -> float:
-    """Calculate reward based on rubric.
+    """Calculate reward based on rubric with comprehensive strategy awareness.
+    
+    New reward system addresses:
+    1. Repeated reading penalty
+    2. Search strategy quality (0/10/1-9 results handling)
+    3. Source precision (not just inclusion)
+    4. Timing bonuses for early discovery
+    5. Balanced penalty/reward structure
     
     Args:
         policy_config: Policy configuration
         rubric: Evaluation rubric with performance metrics
         
     Returns:
-        Reward value between -2 and 2
+        Reward value between -3 and +3
     """
     # Simple reward function: 1 for correct, 0 otherwise
     if policy_config.stupid_simple_reward_fn:
         return float(rubric.answer_correct)
 
-    # Complex reward function with partial credit
+    # ========== BASE PARTIAL REWARDS ==========
     partial_rewards = 0.0
-    partial_rewards += 0.1 if rubric.ever_found_right_email else 0
-    partial_rewards += 0.1 if rubric.ever_read_right_email else 0
+    
+    # Finding and reading correct email (with timing bonus)
+    if rubric.ever_found_right_email:
+        base_find_bonus = 0.15
+        if rubric.turn_found_right_email > 0:
+            # Earlier is better: +0.15 at turn 1, +0.075 at turn 5, +0.03 at turn 9
+            timing_bonus = base_find_bonus * (1 - rubric.turn_found_right_email / policy_config.max_turns)
+            partial_rewards += max(0.05, timing_bonus)  # At least 0.05
+        else:
+            partial_rewards += base_find_bonus
+    
+    if rubric.ever_read_right_email:
+        base_read_bonus = 0.15
+        if rubric.turn_read_right_email > 0:
+            timing_bonus = base_read_bonus * (1 - rubric.turn_read_right_email / policy_config.max_turns)
+            partial_rewards += max(0.05, timing_bonus)
+        else:
+            partial_rewards += base_read_bonus
+    
+    # Not reading invalid emails
     partial_rewards += 0.1 if not rubric.ever_tried_to_read_invalid_email else 0
-    partial_rewards += 0.1 if rubric.sources_correct else 0
     
-    # Penalty for repeated searches (inefficiency)
-    # Each repeated identical search costs -0.15 points
+    # Source precision reward (scaled by precision, not binary)
+    if rubric.source_precision > 0:
+        source_reward = 0.25 * rubric.source_precision
+        partial_rewards += source_reward
+    
+    # ========== SEARCH STRATEGY REWARDS ==========
+    search_strategy_reward = 0.0
+    
+    # Reward good search strategies
+    if rubric.broadened_search_after_zero_results > 0:
+        search_strategy_reward += 0.20 * rubric.broadened_search_after_zero_results
+    
+    if rubric.narrowed_search_after_many_results > 0:
+        search_strategy_reward += 0.20 * rubric.narrowed_search_after_many_results
+    
+    if rubric.read_after_optimal_search > 0:
+        search_strategy_reward += 0.25 * rubric.read_after_optimal_search
+    
+    # Penalties for poor search strategies
+    search_strategy_penalty = 0.0
+    
+    # Penalize not adjusting after problematic results
+    if rubric.num_searches_with_zero_results > rubric.broadened_search_after_zero_results:
+        missed = rubric.num_searches_with_zero_results - rubric.broadened_search_after_zero_results
+        search_strategy_penalty += 0.15 * missed
+    
+    if rubric.num_searches_with_too_many_results > rubric.narrowed_search_after_many_results:
+        missed = rubric.num_searches_with_too_many_results - rubric.narrowed_search_after_many_results
+        search_strategy_penalty += 0.15 * missed
+    
+    # Penalize ignoring optimal search results
+    if rubric.ignored_optimal_results > 0:
+        search_strategy_penalty += 0.25 * rubric.ignored_optimal_results
+    
+    search_strategy_reward -= search_strategy_penalty
+    
+    # ========== REPETITION PENALTIES ==========
     repetition_penalty = 0.0
-    if rubric.num_repeated_searches > 0:
-        repetition_penalty += 0.15 * rubric.num_repeated_searches
     
-    # Extra penalty if agent repeated a search that already returned 0 results
-    # This shows poor learning/adaptation
+    # Search repetition penalty (reduced from 0.15 to 0.12)
+    if rubric.num_repeated_searches > 0:
+        repetition_penalty += 0.12 * rubric.num_repeated_searches
+    
     if rubric.repeated_zero_result_search:
         repetition_penalty += 0.15
-
-    # Formatting errors: -2 to -1
+    
+    # NEW: Read repetition penalty
+    if rubric.num_repeated_reads > 0:
+        # Repeated reads are wasteful
+        repetition_penalty += 0.20 * rubric.num_repeated_reads
+    
+    # NEW: Extra penalty for re-reading correct email (very wasteful!)
+    if rubric.repeated_correct_email > 0:
+        repetition_penalty += 0.25 * rubric.repeated_correct_email
+    
+    # NEW: Penalty for incorrect sources
+    if rubric.num_incorrect_sources > 0:
+        # Each wrong source cited: -0.10
+        repetition_penalty += 0.10 * rubric.num_incorrect_sources
+    
+    # ========== FORMATTING ERRORS ==========
     if rubric.cant_parse_tool_call:
-        return -2 + partial_rewards - repetition_penalty
+        return -2.5 + partial_rewards + search_strategy_reward - repetition_penalty
 
     if rubric.bad_tool_call_name:
-        return -1.9 + partial_rewards - repetition_penalty
+        return -2.3 + partial_rewards + search_strategy_reward - repetition_penalty
 
     if rubric.bad_tool_call_args:
-        return -1.8 + partial_rewards - repetition_penalty
+        return -2.1 + partial_rewards + search_strategy_reward - repetition_penalty
 
-    # Wrong answer: -1 to 0
+    # ========== WRONG ANSWER ==========
     if rubric.attempted_answer and not rubric.answer_correct:
-        return -1 + partial_rewards - repetition_penalty
+        return -1.0 + partial_rewards + search_strategy_reward - repetition_penalty
 
-    # Handle "no answer" cases - distinguish between early give-up and running out of turns
-    # 
-    # Two scenarios:
-    # 1. Agent returns "I don't know" BEFORE exhausting turn budget → SEVERE PENALTY
-    #    (This is bad: agent should continue searching until budget is exhausted)
-    # 2. Agent runs out of turns (with or without "I don't know") → REWARD if effort was made
-    #    (This is acceptable: agent tried hard but couldn't find answer)
-    #
+    # ========== NO ANSWER CASES ==========
     if rubric.returned_i_dont_know or rubric.ran_out_of_turns:
-        base_reward = 0 + partial_rewards - repetition_penalty
+        base_reward = 0.0 + partial_rewards + search_strategy_reward - repetition_penalty
         
-        # SEVERE PENALTY for giving up BEFORE running out of turns
-        # This encourages the agent to continue searching until turn budget is exhausted
-        # Note: If agent returns "I don't know" in the last turn, ran_out_of_turns will be True,
-        # so this penalty won't apply (which is correct - they exhausted the budget)
+        # Penalty for early give-up (capped at -1.5)
         if rubric.returned_i_dont_know and not rubric.ran_out_of_turns:
-            # Agent gave up early - this is BAD behavior
-            # Penalty increases with how early they gave up
             min_expected_searches = 3
             early_giveup_penalty = 0.0
             
             if rubric.num_unique_searches < min_expected_searches:
-                # Severe penalty: -0.5 per missing search, up to -1.5
                 missing_searches = min_expected_searches - rubric.num_unique_searches
-                early_giveup_penalty = 0.5 * missing_searches
+                early_giveup_penalty = 0.4 * missing_searches  # Reduced from 0.5
             
-            # Additional penalty for giving up before exhausting turns
-            # This is the main penalty - giving up early is worse than running out of turns
-            early_giveup_penalty += 1.0  # Base penalty for early give-up
+            # Base penalty for early give-up (reduced from 1.0 to 0.5)
+            early_giveup_penalty += 0.5
             
-            # Additional penalty based on remaining turns (encourages using all turns)
-            # If max_turns=10 and agent gave up at turn 4, they wasted 6 turns
+            # Penalty for unused turns (reduced from 0.05 to 0.03)
             remaining_turns = policy_config.max_turns - rubric.num_turns
             if remaining_turns > 0:
-                # Penalty: -0.05 per unused turn (encourages using all available turns)
-                unused_turn_penalty = 0.05 * remaining_turns
+                unused_turn_penalty = 0.03 * remaining_turns
                 early_giveup_penalty += unused_turn_penalty
+            
+            # Cap total penalty at -1.5
+            early_giveup_penalty = min(early_giveup_penalty, 1.5)
             
             rubric.gave_up_too_early = True
             logger.warning(
-                f"Agent gave up EARLY (before turn budget exhausted): "
-                f"only {rubric.num_unique_searches} unique searches, "
-                f"{rubric.num_turns}/{policy_config.max_turns} turns used. "
-                f"Total penalty: -{early_giveup_penalty:.2f}"
+                f"Agent gave up EARLY: {rubric.num_unique_searches} unique searches, "
+                f"{rubric.num_turns}/{policy_config.max_turns} turns. "
+                f"Penalty: -{early_giveup_penalty:.2f}"
             )
             base_reward -= early_giveup_penalty
         
-        # REWARD for running out of turns after making good effort
-        # This encourages continuing to search until turn budget is exhausted
-        # (This applies whether or not agent returned "I don't know" after running out)
+        # Reward for exhausting turn budget with good effort
         if rubric.ran_out_of_turns:
-            # Agent exhausted turn budget - this is acceptable if they made effort
             effort_bonus = 0.0
             
-            # Reward for making multiple unique searches (showing effort)
             if rubric.num_unique_searches >= 3:
-                # Good effort: tried multiple different searches
-                effort_bonus = 0.2
+                effort_bonus = 0.15
                 if rubric.num_unique_searches >= 5:
-                    # Excellent effort: tried many different searches
-                    effort_bonus = 0.3
-                logger.info(
-                    f"Agent ran out of turns after good effort: "
-                    f"{rubric.num_unique_searches} unique searches. Bonus: +{effort_bonus:.2f}"
-                )
+                    effort_bonus = 0.25
             
-            # REWARD for trying different search parameters after zero results
-            # This encourages adaptive behavior
             if rubric.num_retry_after_zero > 0:
-                retry_bonus = 0.1 * rubric.num_retry_after_zero
-                effort_bonus += retry_bonus
-                logger.info(
-                    f"Agent tried different search parameters after zero results "
-                    f"({rubric.num_retry_after_zero} times). Bonus: +{retry_bonus:.2f}"
-                )
+                effort_bonus += 0.08 * rubric.num_retry_after_zero
             
-            # REWARD for using more turns (encourages using all available turns)
-            # This rewards agents that try harder and use more of their turn budget
-            # The reward is proportional to how many turns were used
-            turn_usage_bonus = 0.02 * rubric.num_turns  # +0.08 for 4 turns, +0.14 for 7 turns
+            # Turn usage bonus (reduced from 0.02 to 0.015)
+            turn_usage_bonus = 0.015 * rubric.num_turns
             effort_bonus += turn_usage_bonus
-            logger.info(
-                f"Agent used {rubric.num_turns}/{policy_config.max_turns} turns. "
-                f"Turn usage bonus: +{turn_usage_bonus:.2f}"
-            )
             
             base_reward += effort_bonus
         
         return base_reward
 
-    # Correct answer: 1 to 2
+    # ========== CORRECT ANSWER ==========
     if rubric.answer_correct:
-        # PERFECT CASE: First turn search, second turn read, third turn answer
-        # This is the ideal behavior - give full marks directly
+        # Perfect execution (relaxed criteria)
         is_perfect = (
-            rubric.num_turns == 3 and
+            rubric.num_turns <= 4 and  # Allow one exploration/adjustment
             rubric.ever_found_right_email and
             rubric.ever_read_right_email and
             rubric.sources_correct and
             rubric.num_repeated_searches == 0 and
-            rubric.num_zero_result_searches == 0
+            rubric.num_repeated_reads == 0 and
+            rubric.num_searches_with_zero_results <= 1 and  # Allow one exploration
+            rubric.read_after_optimal_search > 0  # Must read after optimal search
         )
         
         if is_perfect:
             logger.info(
-                f"Perfect execution: 3 turns (search→read→answer), "
-                f"found and read correct email, correct answer. Full marks: 2.0"
+                f"Perfect execution: {rubric.num_turns} turns, "
+                f"optimal strategy, correct answer. Full marks: 3.0"
             )
-            return 2.0  # Full marks for perfect case
+            return 3.0
         
-        # Normal correct answer calculation
-        reward = 1.0
-        reward += 0.3 if rubric.sources_correct else 0
-        reward += 0.1 / rubric.num_sources if rubric.num_sources > 0 else 0
-        reward += 0.1 * (1 - rubric.num_turns / max(policy_config.max_turns, 1))
-        # Subtract repetition penalty from correct answers too
+        # Normal correct answer
+        reward = 1.5
+        
+        # Source precision bonus (scaled, not binary)
+        if rubric.source_precision > 0:
+            reward += 0.30 * rubric.source_precision
+        
+        # Strategy bonus for reading after optimal search
+        if rubric.read_after_optimal_search > 0:
+            reward += 0.20
+        
+        # Add search strategy rewards
+        reward += search_strategy_reward
+        
+        # Efficiency bonus based on turns used
+        efficiency_bonus = 0.25 * (1 - rubric.num_turns / max(policy_config.max_turns, 1))
+        reward += efficiency_bonus
+        
+        # Subtract penalties
         reward -= repetition_penalty
-        return reward
+        
+        # Cap at 2.8 (perfect is 3.0)
+        return min(reward, 2.8)
 
     logger.warning(f"Rubric not handled properly: {rubric}")
-    return 0.0 - repetition_penalty
+    return 0.0 + search_strategy_reward - repetition_penalty
 
 
 async def determine_if_answer_is_correct(

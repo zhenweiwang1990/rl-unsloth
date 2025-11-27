@@ -88,7 +88,7 @@ echo "💡 Tip: You can change modes with:"
 echo "   ./scripts/run_training.sh simple|rollout|masked"
 echo ""
 
-docker run -d -it \
+docker run -d --restart always \
     $GPU_FLAGS \
     $ENV_FILE \
     -v $(pwd)/data:/workspace/data \
