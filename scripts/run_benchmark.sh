@@ -43,7 +43,7 @@ fi
 # Check if database exists
 if [ ! -f "link_search_agent/data/profiles.db" ]; then
     echo "Error: Database not found at link_search_agent/data/profiles.db"
-    echo "Please run: python scripts/export_to_sqlite.py"
+    echo "Please run: ./scripts/generate_database.sh"
     exit 1
 fi
 
@@ -81,25 +81,10 @@ else
     echo "  - Model: Base model (no fine-tuning)"
 fi
 echo ""
-
-# Prepare Docker command
-# Mount HuggingFace cache to reuse downloaded models
-DOCKER_CMD="docker run --rm -it \
-    $GPU_FLAGS \
-    $ENV_FILE \
-    -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
-    -v $(pwd)/outputs:/workspace/outputs \
-    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-    -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
-    -e HF_HOME=/root/.cache/huggingface \
-    -e HF_HUB_ENABLE_HF_TRANSFER=1 \
-    -e RUN_ID=$RUN_ID \
-    -e TEST_SET_SIZE=$TEST_SET_SIZE \
-    -e VERBOSE=$VERBOSE \
-    $IMAGE_NAME"
-
-# Run benchmark
-echo "Starting benchmark..."
+echo "Volume mounts:"
+echo "  - link_search_agent/data → /workspace/link_search_agent/data"
+echo "  - outputs → /workspace/outputs"
+echo "  - ~/.cache/huggingface → /root/.cache/huggingface"
 echo ""
 
 # Build benchmark command
@@ -120,11 +105,29 @@ if [ -n "$MODEL_PATH" ]; then
     BENCHMARK_CMD="$BENCHMARK_CMD --model-path /workspace/$MODEL_PATH"
 fi
 
-# Run the benchmark
-$DOCKER_CMD $BENCHMARK_CMD
+# Run benchmark in Docker
+echo "Starting benchmark..."
+echo ""
+
+docker run --rm -it \
+    $GPU_FLAGS \
+    $ENV_FILE \
+    -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
+    -v $(pwd)/outputs:/workspace/outputs \
+    -v $HOME/.cache/pip:/root/.cache/pip \
+    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -v $HOME/.cache/modelscope:/root/.cache/modelscope \
+    -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
+    -e HF_HOME=/root/.cache/huggingface \
+    -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+    -e RUN_ID=$RUN_ID \
+    -e TEST_SET_SIZE=$TEST_SET_SIZE \
+    -e VERBOSE=$VERBOSE \
+    $IMAGE_NAME \
+    $BENCHMARK_CMD
 
 echo ""
 echo "=========================================="
 echo "Benchmark Complete!"
 echo "=========================================="
-echo "Results saved to: benchmark_results_linksearch_${RUN_ID}.csv"
+echo "Results saved to: outputs/benchmark_results_linksearch_${RUN_ID}.csv"

@@ -23,7 +23,7 @@ fi
 # Check if database exists
 if [ ! -f "link_search_agent/data/profiles.db" ]; then
     echo "Error: Database not found at link_search_agent/data/profiles.db"
-    echo "Please run: python scripts/export_to_sqlite.py"
+    echo "Please run: ./scripts/generate_database.sh"
     exit 1
 fi
 
@@ -49,6 +49,11 @@ echo "Running evaluation..."
 echo "  Model: $MODEL_PATH"
 echo "  Queries: $NUM_QUERIES"
 echo ""
+echo "Volume mounts:"
+echo "  - link_search_agent/data → /workspace/link_search_agent/data"
+echo "  - outputs → /workspace/outputs"
+echo "  - ~/.cache/huggingface → /root/.cache/huggingface"
+echo ""
 
 # Run evaluation in Docker
 docker run --rm -it \
@@ -56,7 +61,9 @@ docker run --rm -it \
     $ENV_FILE \
     -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
     -v $(pwd)/outputs:/workspace/outputs \
+    -v $HOME/.cache/pip:/root/.cache/pip \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -v $HOME/.cache/modelscope:/root/.cache/modelscope \
     -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \

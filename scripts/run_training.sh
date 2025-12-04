@@ -55,7 +55,7 @@ fi
 # Check if profile database exists
 if [ ! -f "link_search_agent/data/profiles.db" ]; then
     echo "Error: Database not found at link_search_agent/data/profiles.db"
-    echo "Please run: python scripts/export_to_sqlite.py"
+    echo "Please run: ./scripts/generate_database.sh"
     exit 1
 fi
 
@@ -81,19 +81,25 @@ echo "=========================================="
 echo "Starting Training"
 echo "=========================================="
 echo "Training mode: $MODE"
-echo "Cache directory: $HOME/.cache/huggingface"
-ls -lah "$HOME/.cache/huggingface" 2>/dev/null || echo "⚠️  Cache directory not found"
+echo ""
+echo "Volume mounts:"
+echo "  - link_search_agent/data → /workspace/link_search_agent/data"
+echo "  - outputs → /workspace/outputs"
+echo "  - ~/.cache → /root/.cache (HuggingFace, pip)"
 echo ""
 echo "💡 Tip: You can change modes with:"
 echo "   ./scripts/run_training.sh simple|rollout|masked"
 echo ""
 
 docker run -d --restart always \
+    --name link-search-training \
     $GPU_FLAGS \
     $ENV_FILE \
     -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
     -v $(pwd)/outputs:/workspace/outputs \
-    -v $HOME/.cache:/root/.cache \
+    -v $HOME/.cache/pip:/root/.cache/pip \
+    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -v $HOME/.cache/modelscope:/root/.cache/modelscope \
     -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
@@ -101,3 +107,10 @@ docker run -d --restart always \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
     python train_grpo_linksearch.py --mode $MODE --enable-detailed-logging
+
+echo ""
+echo "✓ Training container started: link-search-training"
+echo ""
+echo "To view logs:     docker logs -f link-search-training"
+echo "To stop:          docker stop link-search-training"
+echo "To remove:        docker rm -f link-search-training"

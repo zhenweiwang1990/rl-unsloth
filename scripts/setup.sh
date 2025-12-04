@@ -2,7 +2,7 @@
 set -e
 
 echo "=========================================="
-echo "Link Search Agent GRPO Training - Setup (Docker)"
+echo "Link Search Agent GRPO Training - Setup"
 echo "=========================================="
 echo ""
 
@@ -11,13 +11,24 @@ IMAGE_NAME="link-search-agent-grpo"
 
 # Create necessary directories
 echo "Creating directories..."
-mkdir -p link_search_agent/data outputs .cache
+mkdir -p link_search_agent/data outputs
+mkdir -p $HOME/.cache/pip $HOME/.cache/huggingface $HOME/.cache/modelscope
 touch outputs/.gitkeep
 
-# Build Docker image
+echo "✓ Directories created"
+echo "  - link_search_agent/data (for SQLite database)"
+echo "  - outputs (for checkpoints and logs)"
+echo "  - ~/.cache/pip (pip cache)"
+echo "  - ~/.cache/huggingface (model cache)"
+echo "  - ~/.cache/modelscope (ModelScope cache)"
 echo ""
+
+# Build Docker image
 echo "Building Docker image..."
 docker build -t $IMAGE_NAME .
+
+echo ""
+echo "✓ Docker image built: $IMAGE_NAME"
 
 # Check if .env file exists
 if [ ! -f ".env" ]; then
@@ -25,8 +36,9 @@ if [ ! -f ".env" ]; then
     echo "Creating .env file from env.example..."
     if [ -f "env.example" ]; then
         cp env.example .env
-        echo "✓ Created .env file. Please edit it and add your HF_TOKEN."
+        echo "✓ Created .env file"
     else
+        echo "⚠️  env.example not found, creating minimal .env"
         cat > .env << 'EOF'
 # HuggingFace Token (required for private datasets)
 HF_TOKEN=
@@ -34,44 +46,43 @@ HF_TOKEN=
 # Model configuration
 MODEL_NAME=unsloth/Qwen3-30B-A3B-128K
 
-# Training configuration
-TRAIN_DATASET_SIZE=1000
-EVAL_DATASET_SIZE=100
-MAX_STEPS=200
-LEARNING_RATE=1e-5
-PER_DEVICE_TRAIN_BATCH_SIZE=2
-NUM_GENERATIONS=3
-
-# Agent configuration
-MAX_TURNS=15
-MAX_TOKENS=4096
-MAX_PROFILES=10
-
-# WandB (optional)
-WANDB_PROJECT=link-search-grpo
-WANDB_MODE=online
+# PostgreSQL Export Configuration
+# PG_HOST=your-host.com
+# PG_PORT=5432
+# PG_USER=postgres
+# PG_PASSWORD=your-password
+# PG_DATABASE=your-database
 EOF
-        echo "✓ Created .env file. Please edit it and add your HF_TOKEN."
     fi
+    echo ""
+    echo "⚠️  Please edit .env and configure:"
+    echo "   1. HF_TOKEN (for HuggingFace dataset access)"
+    echo "   2. PG_* variables (for database export)"
 else
     echo ""
-    echo ".env file already exists."
+    echo "✓ .env file already exists"
 fi
 
 # Check if profile database exists
 echo ""
 if [ -f "link_search_agent/data/profiles.db" ]; then
-    echo "✓ Profile database found at link_search_agent/data/profiles.db"
+    echo "✓ Profile database found"
     DB_SIZE=$(du -h link_search_agent/data/profiles.db | cut -f1)
     echo "  Size: $DB_SIZE"
+    
+    # Show row counts using Docker
+    echo "  Contents:"
+    docker run --rm \
+        -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
+        $IMAGE_NAME \
+        sqlite3 /workspace/link_search_agent/data/profiles.db \
+        "SELECT '    Profiles: ' || COUNT(*) FROM profiles; SELECT '    Experiences: ' || COUNT(*) FROM experiences; SELECT '    Educations: ' || COUNT(*) FROM educations;" 2>/dev/null || echo "    (unable to read)"
 else
-    echo "⚠️  Profile database not found."
+    echo "⚠️  Profile database not found"
     echo ""
-    echo "To export the database from PostgreSQL, run:"
-    echo "  python scripts/export_to_sqlite.py"
-    echo ""
-    echo "Make sure to set the following environment variables:"
-    echo "  PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DATABASE"
+    echo "To export the database from PostgreSQL:"
+    echo "  1. Configure PG_* variables in .env"
+    echo "  2. Run: ./scripts/generate_database.sh"
 fi
 
 echo ""
@@ -79,10 +90,18 @@ echo "=========================================="
 echo "Setup Complete!"
 echo "=========================================="
 echo ""
-echo "Next steps:"
-echo "1. Edit .env and add your HF_TOKEN (for HuggingFace dataset access)"
-echo "2. Export database: python scripts/export_to_sqlite.py (if not done)"
-echo "3. Start training: ./scripts/run_training.sh"
+echo "All operations run inside Docker containers."
 echo ""
-echo "All commands will run inside Docker containers."
+echo "Next steps:"
+echo "  1. Edit .env and configure HF_TOKEN and PG_* variables"
+echo "  2. Export database: ./scripts/generate_database.sh"
+echo "  3. Start training: ./scripts/run_training.sh"
+echo ""
+echo "Available commands:"
+echo "  ./scripts/setup.sh           - This setup script"
+echo "  ./scripts/build_docker.sh    - Rebuild Docker image"
+echo "  ./scripts/generate_database.sh - Export PostgreSQL to SQLite"
+echo "  ./scripts/run_training.sh    - Start GRPO training"
+echo "  ./scripts/run_eval.sh        - Evaluate trained model"
+echo "  ./scripts/run_benchmark.sh   - Run benchmark tests"
 echo ""

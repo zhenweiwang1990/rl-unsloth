@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Export dev_set schema from PostgreSQL to local SQLite (excluding large fields)."""
+"""Export dev_set schema from PostgreSQL to local SQLite (excluding large fields).
+
+Usage:
+    # Set environment variables first
+    export PG_HOST=your-host.com
+    export PG_PORT=5432
+    export PG_USER=postgres
+    export PG_PASSWORD=your-password
+    export PG_DATABASE=your-database
+    
+    python scripts/export_to_sqlite.py
+"""
 
 import os
 import json
@@ -7,18 +18,37 @@ import sqlite3
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# PostgreSQL connection
-PG_CONFIG = {
-    "host": "ep-raspy-dream-ad075y5b-pooler.c-2.us-east-1.aws.neon.tech",
-    "database": "neondb",
-    "user": "neondb_owner",
-    "password": "npg_rFbv9hWCgG6i",
-    "port": 5432,
-    "sslmode": "require",
-}
 
-# SQLite output path
-SQLITE_PATH = os.path.join(os.path.dirname(__file__), "..", "link_search_agent", "data", "profiles.db")
+def get_pg_config():
+    """Get PostgreSQL connection config from environment variables."""
+    host = os.environ.get("PG_HOST")
+    user = os.environ.get("PG_USER")
+    password = os.environ.get("PG_PASSWORD")
+    database = os.environ.get("PG_DATABASE")
+    port = int(os.environ.get("PG_PORT", "5432"))
+    sslmode = os.environ.get("PG_SSLMODE", "require")
+    
+    if not all([host, user, password, database]):
+        raise ValueError(
+            "Missing PostgreSQL connection details. "
+            "Please set PG_HOST, PG_USER, PG_PASSWORD, PG_DATABASE environment variables."
+        )
+    
+    return {
+        "host": host,
+        "database": database,
+        "user": user,
+        "password": password,
+        "port": port,
+        "sslmode": sslmode,
+    }
+
+
+# SQLite output path (can be overridden by SQLITE_OUTPUT_PATH env var)
+SQLITE_PATH = os.environ.get(
+    "SQLITE_OUTPUT_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "link_search_agent", "data", "profiles.db")
+)
 
 
 def create_sqlite_schema(conn: sqlite3.Connection):
@@ -246,6 +276,9 @@ def export_educations(pg_conn, sqlite_conn):
 
 
 def main():
+    # Get PostgreSQL config from environment
+    pg_config = get_pg_config()
+    
     # Create output directory
     os.makedirs(os.path.dirname(SQLITE_PATH), exist_ok=True)
     
@@ -254,8 +287,8 @@ def main():
         print(f"Removing existing SQLite file: {SQLITE_PATH}")
         os.remove(SQLITE_PATH)
     
-    print(f"Connecting to PostgreSQL...")
-    pg_conn = psycopg2.connect(**PG_CONFIG)
+    print(f"Connecting to PostgreSQL ({pg_config['host']})...")
+    pg_conn = psycopg2.connect(**pg_config)
     
     print(f"Creating SQLite database: {SQLITE_PATH}")
     sqlite_conn = sqlite3.connect(SQLITE_PATH)
