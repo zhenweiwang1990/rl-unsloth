@@ -2,22 +2,16 @@
 set -e
 
 echo "=========================================="
-echo "Generating Email Database (Docker)"
+echo "Generating Profile Database (PostgreSQL → SQLite)"
 echo "=========================================="
 echo ""
 
-# Docker image name
-IMAGE_NAME="email-agent-grpo"
-
-# Check if Docker image exists
-if ! docker image inspect $IMAGE_NAME &> /dev/null; then
-    echo "Docker image '$IMAGE_NAME' not found. Building..."
-    docker build -t $IMAGE_NAME .
-fi
-
 # Check if database already exists
-if [ -f "data/enron_emails.db" ]; then
-    echo "Database already exists at data/enron_emails.db"
+if [ -f "link_search_agent/data/profiles.db" ]; then
+    echo "Database already exists at link_search_agent/data/profiles.db"
+    DB_SIZE=$(du -h link_search_agent/data/profiles.db | cut -f1)
+    echo "Current size: $DB_SIZE"
+    echo ""
     read -p "Do you want to regenerate it? (y/n) " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -25,33 +19,80 @@ if [ -f "data/enron_emails.db" ]; then
         exit 0
     fi
     echo "Removing existing database..."
-    rm data/enron_emails.db
+    rm link_search_agent/data/profiles.db
 fi
 
-echo "Generating database from Enron email dataset..."
+# Check for required environment variables
+if [ -z "$PG_HOST" ] || [ -z "$PG_USER" ] || [ -z "$PG_PASSWORD" ] || [ -z "$PG_DATABASE" ]; then
+    echo "PostgreSQL connection details required."
+    echo ""
+    echo "Please set the following environment variables:"
+    echo "  PG_HOST      - PostgreSQL host"
+    echo "  PG_PORT      - PostgreSQL port (default: 5432)"
+    echo "  PG_USER      - PostgreSQL user"
+    echo "  PG_PASSWORD  - PostgreSQL password"
+    echo "  PG_DATABASE  - PostgreSQL database name"
+    echo ""
+    echo "Example:"
+    echo "  export PG_HOST=your-host.com"
+    echo "  export PG_PORT=5432"
+    echo "  export PG_USER=postgres"
+    echo "  export PG_PASSWORD=your-password"
+    echo "  export PG_DATABASE=your-database"
+    echo "  ./scripts/generate_database.sh"
+    echo ""
+    
+    # Try to load from .env
+    if [ -f ".env" ]; then
+        echo "Attempting to load from .env file..."
+        set -a
+        source .env
+        set +a
+        
+        if [ -z "$PG_HOST" ] || [ -z "$PG_USER" ] || [ -z "$PG_PASSWORD" ] || [ -z "$PG_DATABASE" ]; then
+            echo "PostgreSQL variables not found in .env"
+            exit 1
+        fi
+        echo "✓ Loaded from .env"
+    else
+        exit 1
+    fi
+fi
+
+echo "PostgreSQL Connection:"
+echo "  Host: $PG_HOST"
+echo "  Port: ${PG_PORT:-5432}"
+echo "  User: $PG_USER"
+echo "  Database: $PG_DATABASE"
+echo ""
+
+# Create data directory if it doesn't exist
+mkdir -p link_search_agent/data
+
+echo "Exporting database from PostgreSQL..."
 echo "This may take several minutes..."
 echo ""
 
-# Run database generation in Docker
-docker run --rm \
-    -v $(pwd)/data:/workspace/data \
-    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-    -e HF_HOME=/root/.cache/huggingface \
-    -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
-    $IMAGE_NAME \
-    python -c "
-from email_agent.data import generate_database
-import os
-
-os.environ['EMAIL_DB_PATH'] = '/workspace/data/enron_emails.db'
-print('Starting database generation...')
-generate_database(overwrite=True)
-print('\n✓ Database generated successfully!')
-print(f'Database location: /workspace/data/enron_emails.db')
-"
+# Run export script
+python scripts/export_to_sqlite.py
 
 echo ""
 echo "=========================================="
 echo "Database Generation Complete!"
 echo "=========================================="
-echo "Database saved to: $(pwd)/data/enron_emails.db"
+
+if [ -f "link_search_agent/data/profiles.db" ]; then
+    DB_SIZE=$(du -h link_search_agent/data/profiles.db | cut -f1)
+    echo "Database saved to: link_search_agent/data/profiles.db"
+    echo "Size: $DB_SIZE"
+    echo ""
+    
+    # Show row counts
+    echo "Contents:"
+    sqlite3 link_search_agent/data/profiles.db "SELECT 'Profiles: ' || COUNT(*) FROM profiles;"
+    sqlite3 link_search_agent/data/profiles.db "SELECT 'Experiences: ' || COUNT(*) FROM experiences;"
+    sqlite3 link_search_agent/data/profiles.db "SELECT 'Educations: ' || COUNT(*) FROM educations;"
+else
+    echo "Error: Database file was not created"
+    exit 1
+fi

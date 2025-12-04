@@ -2,19 +2,18 @@
 set -e
 
 echo "=========================================="
-echo "Email Agent - Benchmark (Docker)"
+echo "Link Search Agent - Benchmark (Docker)"
 echo "=========================================="
 echo ""
 
 # Docker image name
-IMAGE_NAME="email-agent-grpo"
+IMAGE_NAME="link-search-agent-grpo"
 
 # Default values
 MODEL_PATH="${1:-}"
 RUN_ID="${RUN_ID:-001}"
 TEST_SET_SIZE="${TEST_SET_SIZE:-100}"
 VERBOSE="${VERBOSE:-false}"
-USE_CACHE_ONLY="${USE_CACHE_ONLY:-false}"
 
 # Display usage information
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -26,8 +25,11 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     echo "  VERBOSE         - Enable detailed logs (default: false)"
     echo ""
     echo "Examples:"
-    echo "  # Run with default settings"
+    echo "  # Run with default settings (base model)"
     echo "  ./scripts/run_benchmark.sh"
+    echo ""
+    echo "  # Run with fine-tuned model"
+    echo "  ./scripts/run_benchmark.sh outputs/grpo_linksearch_masked/final"
     echo ""
     echo "  # Run with verbose output (detailed logs)"
     echo "  VERBOSE=true ./scripts/run_benchmark.sh"
@@ -39,9 +41,9 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
 fi
 
 # Check if database exists
-if [ ! -f "data/enron_emails.db" ]; then
-    echo "Error: Database not found at data/enron_emails.db"
-    echo "Please run ./scripts/generate_database.sh first."
+if [ ! -f "link_search_agent/data/profiles.db" ]; then
+    echo "Error: Database not found at link_search_agent/data/profiles.db"
+    echo "Please run: python scripts/export_to_sqlite.py"
     exit 1
 fi
 
@@ -85,10 +87,10 @@ echo ""
 DOCKER_CMD="docker run --rm -it \
     $GPU_FLAGS \
     $ENV_FILE \
-    -v $(pwd)/data:/workspace/data \
+    -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
     -v $(pwd)/outputs:/workspace/outputs \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-    -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
+    -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
     -e RUN_ID=$RUN_ID \
@@ -101,7 +103,7 @@ echo "Starting benchmark..."
 echo ""
 
 # Build benchmark command
-BENCHMARK_CMD="python benchmark.py --limit $TEST_SET_SIZE"
+BENCHMARK_CMD="python benchmark_linksearch.py --limit $TEST_SET_SIZE"
 
 # Add verbose flag if enabled
 if [ "$VERBOSE" = "true" ]; then
@@ -125,5 +127,4 @@ echo ""
 echo "=========================================="
 echo "Benchmark Complete!"
 echo "=========================================="
-echo "Results saved to: benchmark_results_${RUN_ID}.csv"
-
+echo "Results saved to: benchmark_results_linksearch_${RUN_ID}.csv"

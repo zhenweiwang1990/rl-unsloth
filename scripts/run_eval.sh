@@ -2,15 +2,15 @@
 set -e
 
 echo "=========================================="
-echo "Email Agent Evaluation (Docker)"
+echo "Link Search Agent Evaluation (Docker)"
 echo "=========================================="
 echo ""
 
 # Docker image name
-IMAGE_NAME="email-agent-grpo"
+IMAGE_NAME="link-search-agent-grpo"
 
 # Default values
-MODEL_PATH="${1:-outputs/grpo/final}"
+MODEL_PATH="${1:-outputs/grpo_linksearch_masked/final}"
 NUM_QUERIES="${2:-100}"
 
 # Check if model exists
@@ -21,9 +21,9 @@ if [ ! -d "$MODEL_PATH" ]; then
 fi
 
 # Check if database exists
-if [ ! -f "data/enron_emails.db" ]; then
-    echo "Error: Database not found at data/enron_emails.db"
-    echo "Please run ./scripts/generate_database.sh first."
+if [ ! -f "link_search_agent/data/profiles.db" ]; then
+    echo "Error: Database not found at link_search_agent/data/profiles.db"
+    echo "Please run: python scripts/export_to_sqlite.py"
     exit 1
 fi
 
@@ -54,17 +54,16 @@ echo ""
 docker run --rm -it \
     $GPU_FLAGS \
     $ENV_FILE \
-    -v $(pwd)/data:/workspace/data \
+    -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
     -v $(pwd)/outputs:/workspace/outputs \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-    -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
+    -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
     $IMAGE_NAME \
-    python eval.py --model-path /workspace/$MODEL_PATH --num-queries $NUM_QUERIES
+    python eval_linksearch.py --model-path /workspace/$MODEL_PATH --num-queries $NUM_QUERIES
 
 echo ""
 echo "=========================================="
 echo "Evaluation Complete!"
 echo "=========================================="
-

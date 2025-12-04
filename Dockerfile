@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     git \
     wget \
     curl \
+    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
@@ -27,7 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY . .
 
 # Create necessary directories
-RUN mkdir -p /workspace/outputs /workspace/data
+RUN mkdir -p /workspace/outputs /workspace/link_search_agent/data
 
 # Set environment variables
 ENV PYTHONPATH=/workspace:$PYTHONPATH
@@ -35,9 +36,11 @@ ENV PYTHONPATH=/workspace:$PYTHONPATH
 ENV PIP_CACHE_DIR=/root/.cache/pip
 ENV HF_HOME=/root/.cache/huggingface
 ENV HF_HUB_CACHE=/root/.cache/huggingface/hub
+# ModelScope mirror for China
+ENV MODELSCOPE_CACHE=/root/.cache/modelscope
 
 # Make scripts executable
 RUN chmod +x /workspace/scripts/*.sh
 
 # Default command: setup and show instructions
-CMD ["bash", "-c", "echo '=== Email Agent GRPO Training ==='; echo ''; echo 'Available commands:'; echo '  - Generate database: python -m email_agent.data.local_email_db'; echo '  - Run training: python train_grpo.py'; echo '  - Run evaluation: python eval.py'; echo '  - Test setup: python test_setup.py'; echo ''; exec bash"]
+CMD ["bash", "-c", "echo '=== Link Search Agent GRPO Training ==='; echo ''; echo 'Available commands:'; echo '  - Run training: python train_grpo_linksearch.py --mode masked'; echo '  - Run evaluation: python eval_linksearch.py'; echo '  - Run benchmark: python benchmark_linksearch.py'; echo '  - Test setup: python test_setup.py'; echo ''; exec bash"]

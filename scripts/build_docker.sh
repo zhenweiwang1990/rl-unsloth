@@ -2,12 +2,12 @@
 set -e
 
 echo "=========================================="
-echo "Email Agent - Docker Build"
+echo "Link Search Agent - Docker Build"
 echo "=========================================="
 echo ""
 
 # Default values
-IMAGE_NAME="${IMAGE_NAME:-email-agent-grpo}"
+IMAGE_NAME="${IMAGE_NAME:-link-search-agent-grpo}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 NO_CACHE="${NO_CACHE:-false}"
 
@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --name NAME       Docker image name (default: email-agent-grpo)"
+            echo "  --name NAME       Docker image name (default: link-search-agent-grpo)"
             echo "  --tag TAG         Docker image tag (default: latest)"
             echo "  --no-cache        Build without using cache"
             echo "  --help            Show this help message"
@@ -81,6 +81,7 @@ echo "Setting up cache directories..."
 mkdir -p "$HOME/.cache/pip"
 mkdir -p "$HOME/.cache/huggingface"
 mkdir -p "$HOME/.cache/transformers"
+mkdir -p "$HOME/.cache/modelscope"
 echo "  ✓ Cache directories ready"
 echo ""
 
@@ -124,12 +125,13 @@ if [ $BUILD_STATUS -eq 0 ]; then
     echo "Cache directories (mounted at runtime):"
     echo "  - Host pip cache: ~/.cache/pip"
     echo "  - Host HF cache: ~/.cache/huggingface"
+    echo "  - Host ModelScope cache: ~/.cache/modelscope"
     echo "  - Container pip cache: /root/.cache/pip"
     echo "  - Container HF cache: /root/.cache/huggingface"
     echo ""
     
     echo "Next steps:"
-    echo "  1. Generate database: ./scripts/generate_database.sh"
+    echo "  1. Export database: python scripts/export_to_sqlite.py"
     echo "  2. Run training: ./scripts/run_training.sh"
     echo "  3. Run benchmark: ./scripts/run_benchmark.sh"
     echo ""
@@ -137,7 +139,7 @@ if [ $BUILD_STATUS -eq 0 ]; then
     echo "  docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it \\"
     echo "    -v ~/.cache/pip:/root/.cache/pip \\"
     echo "    -v ~/.cache/huggingface:/root/.cache/huggingface \\"
-    echo "    -v \$(pwd)/data:/workspace/data \\"
+    echo "    -v \$(pwd)/link_search_agent/data:/workspace/link_search_agent/data \\"
     echo "    -v \$(pwd)/outputs:/workspace/outputs \\"
     echo "    --env-file .env \\"
     echo "    $FULL_IMAGE_NAME bash"
@@ -148,4 +150,3 @@ fi
 
 echo ""
 echo "=========================================="
-

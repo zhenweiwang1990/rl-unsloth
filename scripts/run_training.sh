@@ -19,7 +19,7 @@ if [[ ! "$MODE" =~ ^(simple|rollout|masked)$ ]]; then
 fi
 
 echo "=========================================="
-echo "Email Agent GRPO Training (Docker)"
+echo "Link Search Agent GRPO Training (Docker)"
 echo "Mode: $MODE"
 echo "=========================================="
 echo ""
@@ -41,7 +41,7 @@ esac
 echo ""
 
 # Docker image name
-IMAGE_NAME="email-agent-grpo"
+IMAGE_NAME="link-search-agent-grpo"
 
 # Load environment variables
 ENV_FILE=""
@@ -52,10 +52,10 @@ else
     echo "ℹ️  No .env file found, using default settings"
 fi
 
-# Check if database exists
-if [ ! -f "data/enron_emails.db" ]; then
-    echo "Error: Database not found at data/enron_emails.db"
-    echo "Please run ./scripts/generate_database.sh first."
+# Check if profile database exists
+if [ ! -f "link_search_agent/data/profiles.db" ]; then
+    echo "Error: Database not found at link_search_agent/data/profiles.db"
+    echo "Please run: python scripts/export_to_sqlite.py"
     exit 1
 fi
 
@@ -91,13 +91,13 @@ echo ""
 docker run -d --restart always \
     $GPU_FLAGS \
     $ENV_FILE \
-    -v $(pwd)/data:/workspace/data \
+    -v $(pwd)/link_search_agent/data:/workspace/link_search_agent/data \
     -v $(pwd)/outputs:/workspace/outputs \
     -v $HOME/.cache:/root/.cache \
-    -e EMAIL_DB_PATH=/workspace/data/enron_emails.db \
+    -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
     -e HF_DATASETS_CACHE=/root/.cache/huggingface \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
-    python train_grpo.py --mode $MODE --resume_best --enable-detailed-logging
+    python train_grpo_linksearch.py --mode $MODE --enable-detailed-logging
