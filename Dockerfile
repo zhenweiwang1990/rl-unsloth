@@ -16,12 +16,19 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN pip3 install --upgrade pip
 
-# Copy requirements first for better caching
+# Copy requirements first
 COPY requirements.txt .
-# Use BuildKit cache mount to speed up pip installs across builds
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -r requirements.txt && \
-    # Remove deprecated pynvml and install nvidia-ml-py to fix warnings
+
+# 1. Install Unsloth and Transformers FIRST (just like manual test)
+# We force upgrade to ensure no conflicts with pre-installed packages
+RUN pip3 install --no-cache-dir --upgrade \
+    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" \
+    "transformers>=4.40.0" \
+    "torch>=2.0.0"
+
+# 2. Install remaining dependencies
+# Remove deprecated pynvml and install nvidia-ml-py to fix warnings
+RUN pip3 install --no-cache-dir -r requirements.txt && \
     pip3 uninstall -y pynvml 2>/dev/null || true
 
 # Copy the entire project

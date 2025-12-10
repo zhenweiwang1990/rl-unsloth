@@ -88,18 +88,13 @@ def patch_qwen3_gradient_checkpointing(model):
     return patched
 
 
-# Import model loader utility
-try:
-    from link_search_agent.model_loader import load_model_with_unsloth
-except ImportError:
-    # Fallback if module not available
-    def load_model_with_unsloth(model_name: str, max_seq_length: int, load_in_4bit: bool):
-        return FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=max_seq_length,
-            load_in_4bit=load_in_4bit,
-            dtype=None,
-        )
+def load_model_with_unsloth(model_name: str, max_seq_length: int, load_in_4bit: bool):
+    return FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        load_in_4bit=load_in_4bit,
+        dtype=None,
+    )
 
 
 def main():
