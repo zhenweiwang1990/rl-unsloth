@@ -102,7 +102,8 @@ docker run -d --restart always \
     -v $HOME/.cache/modelscope:/root/.cache/modelscope \
     -e LINK_SEARCH_DB_PATH=/workspace/link_search_agent/data/profiles.db \
     -e HF_HOME=/root/.cache/huggingface \
-    -e HF_HUB_ENABLE_HF_TRANSFER=1 \
+    -e UNSLOTH_FAST_DOWNLOAD=0 \
+    -e HF_HUB_ENABLE_HF_TRANSFER=0 \
     -e HF_DATASETS_CACHE=/root/.cache/huggingface \
     -e PYTHONUNBUFFERED=1 \
     $IMAGE_NAME \
