@@ -65,6 +65,11 @@ if ! docker image inspect $IMAGE_NAME &> /dev/null; then
     docker build -t $IMAGE_NAME .
 fi
 
+# Create cache directories if they don't exist
+mkdir -p $HOME/.cache/huggingface/hub
+mkdir -p $HOME/.cache/pip
+mkdir -p $HOME/.cache/modelscope
+
 # Check for GPU
 if command -v nvidia-smi &> /dev/null; then
     echo "GPU Information:"
